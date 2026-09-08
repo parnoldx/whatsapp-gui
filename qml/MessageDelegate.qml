@@ -23,6 +23,10 @@ Item {
 
     readonly property bool fromMe: message && message.fromMe === true
     readonly property string kind: message && message.kind ? message.kind : "text"
+    readonly property var albumItems: {
+        var list = message && message.album ? message.album : []
+        return (list && list.length > 1) ? list : []
+    }
     readonly property var linked: Model.linkify((message && (message.text || message.caption)) || "")
     readonly property var preview: {
         var fromMsg = message && message.linkPreview
@@ -136,8 +140,88 @@ Item {
                     }
                 }
 
+                Grid {
+                    id: albumGrid
+                    visible: root.albumItems.length > 1
+                    width: parent.width
+                    columns: 2
+                    spacing: 2
+                    property int tile: Math.max(1, Math.floor((width - spacing) / 2))
+                    Repeater {
+                        model: root.albumItems
+                        Rectangle {
+                            required property var modelData
+                            width: albumGrid.tile
+                            height: albumGrid.tile
+                            radius: 4
+                            clip: true
+                            color: Qt.rgba(0, 0, 0, 0.25)
+                            Image {
+                                anchors.fill: parent
+                                visible: modelData.kind !== "gif" && modelData.kind !== "video" && modelData.downloaded
+                                source: modelData.fileUrl || ""
+                                fillMode: Image.PreserveAspectCrop
+                                asynchronous: true
+                                cache: true
+                            }
+                            AnimatedImage {
+                                anchors.fill: parent
+                                visible: modelData.kind === "gif" && modelData.downloaded
+                                source: modelData.fileUrl || ""
+                                fillMode: Image.PreserveAspectCrop
+                                playing: true
+                            }
+                            Image {
+                                anchors.fill: parent
+                                visible: modelData.kind === "video" && !!(modelData.thumbUrl)
+                                source: modelData.thumbUrl || ""
+                                fillMode: Image.PreserveAspectCrop
+                                asynchronous: true
+                                cache: true
+                            }
+                            Rectangle {
+                                visible: modelData.kind === "video" && modelData.downloaded
+                                anchors.centerIn: parent
+                                width: 36
+                                height: 36
+                                radius: 18
+                                color: Qt.rgba(0, 0, 0, 0.45)
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "\u25B6"
+                                    textFormat: Text.PlainText
+                                    color: "#ffffff"
+                                    font.pixelSize: 14
+                                }
+                            }
+                            Rectangle {
+                                anchors.fill: parent
+                                visible: !modelData.downloaded
+                                color: Qt.rgba(0, 0, 0, 0.25)
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "↓"
+                                    textFormat: Text.PlainText
+                                    color: Theme.textPrimary
+                                    font.pixelSize: 18
+                                }
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: {
+                                    var copy = {}
+                                    var k
+                                    for (k in root.message) copy[k] = root.message[k]
+                                    for (k in modelData) copy[k] = modelData[k]
+                                    modelData.downloaded ? root.openMedia(copy) : root.download(copy)
+                                }
+                            }
+                        }
+                    }
+                }
+
                 Item {
-                    visible: kind === "image" || kind === "sticker" || kind === "gif"
+                    visible: root.albumItems.length === 0 && (kind === "image" || kind === "sticker" || kind === "gif")
                     width: parent.width
                     height: kind === "sticker" ? 140 : 220
                     Image {
@@ -173,7 +257,7 @@ Item {
                 }
 
                 Rectangle {
-                    visible: kind === "video"
+                    visible: root.albumItems.length === 0 && kind === "video"
                     width: parent.width
                     height: 180
                     color: Qt.rgba(0, 0, 0, 0.35)

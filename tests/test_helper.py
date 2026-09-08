@@ -222,6 +222,59 @@ class HelperTests(unittest.TestCase):
         self.assertEqual([m["id"] for m in messages], ["a2", "t1"])
         stub = next(m for m in messages if m["id"] == "t1")
         self.assertEqual(stub["text"], "Unsupported message")
+        self.assertFalse(messages[0].get("album"))
+
+    def test_album_label_folds_photos_into_one_message(self):
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO chats VALUES (?,?,?,?,?,?,?,?,?)",
+            ("777@s.whatsapp.net", "dm", "Fabian", 400, 0, 0, 0, 0, 1),
+        )
+
+        def msg(mid, ts, text="", display="", media="", caption="", quoted=""):
+            con.execute(
+                """INSERT INTO messages (
+                     chat_jid, chat_name, msg_id, sender_jid, sender_name, ts, from_me,
+                     text, display_text, quoted_msg_id, quoted_sender_jid, is_forwarded,
+                     forwarding_score, reaction_to_id, reaction_emoji, media_type,
+                     media_caption, filename, mime_type, file_length, local_path,
+                     downloaded_at, media_unavailable_at, revoked, deleted_for_me,
+                     edited, buttons
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    "777@s.whatsapp.net", "Fabian", mid, "777@s.whatsapp.net", "Fabian",
+                    ts, 0, text, display, quoted, "", 0, 0, "", "", media, caption, "", "",
+                    0, "", 0, 0, 0, 0, 0, "",
+                ),
+            )
+
+        # Labeled album stub + two photos at the same second: one bubble.
+        msg("s1", 400, text="[Album: 2 images]", display="[Album: 2 images]")
+        msg("p1", 400, display="Sent image", media="image", caption="Haha liebe den Twist am Ende.")
+        msg("p2", 400, display="Sent image", media="image")
+        # Reply quotes the dropped stub — jump has to land on the folded album.
+        msg("r1", 410, text="Welcher Twist", display="> [Album: 2 images]\nWelcher Twist", quoted="s1")
+        # Two photos 22s apart, no stub: stay separate.
+        msg("d1", 350, display="Sent image", media="image")
+        msg("d2", 372, display="Sent image", media="image")
+        con.commit()
+        con.close()
+        code, payload = run_helper(["messages", "--chat", "777@s.whatsapp.net"], self.env)
+        self.assertEqual(code, 0)
+        messages = payload["data"]["messages"]
+        self.assertEqual([m["id"] for m in messages], ["d1", "d2", "p1", "r1"])
+        album = next(m for m in messages if m["id"] == "p1")
+        self.assertEqual([a["id"] for a in album["album"]], ["p1", "p2"])
+        self.assertEqual(album["albumId"], "s1")
+        self.assertEqual(album["caption"], "Haha liebe den Twist am Ende.")
+        self.assertEqual(album["text"], "Haha liebe den Twist am Ende.")
+        self.assertEqual(album["kind"], "image")
+        self.assertNotIn("_album", album)
+        self.assertFalse(messages[0].get("album"))
+        self.assertFalse(messages[1].get("album"))
+        reply = next(m for m in messages if m["id"] == "r1")
+        self.assertEqual(reply["quotedId"], "s1")
+        self.assertEqual(reply["quotedText"], "Haha liebe den Twist am Ende.")
 
     def test_messages_skip_deleted_and_expose_links(self):
         code, payload = run_helper(["messages", "--chat", "111@s.whatsapp.net"], self.env)
@@ -824,6 +877,9 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(self.mod.pick_name("666@g.us", jid="666@g.us"), "Unknown group")
         self.assertEqual(self.mod.human_preview("Sent image"), "Photo")
         self.assertEqual(self.mod.placeholder_label("sent video"), "Video")
+        self.assertEqual(self.mod.human_preview("[Album: 2 images]"), "Photo")
+        self.assertEqual(self.mod.album_count("[Album: 3 images]"), 3)
+        self.assertEqual(self.mod.album_count("Wer ist das?"), 0)
 
 
 if __name__ == "__main__":

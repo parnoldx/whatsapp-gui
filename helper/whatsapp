@@ -35,6 +35,8 @@ WACLI = os.environ.get("WACLI_BIN", "wacli")
 JID_RE = re.compile(r"^[A-Za-z0-9._:-]+@[A-Za-z0-9._-]+$")
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
 MEDIA_KINDS = {"image", "video", "gif", "sticker", "voice", "audio", "document"}
+ALBUM_MEDIA = {"image", "video", "gif"}
+ALBUM_RE = re.compile(r"^\[Album:\s*(\d+)\s+\w+\]$", re.I)
 PLACEHOLDERS = {
     "sent image": "Photo",
     "image": "Photo",
@@ -285,10 +287,17 @@ def pick_name(*parts: object, jid: str = "") -> str:
     return fallback_from_jid(jid)
 
 
+def album_count(text: str) -> int:
+    match = ALBUM_RE.match(str(text or "").strip())
+    return int(match.group(1)) if match else 0
+
+
 def placeholder_label(value: str) -> str:
     key = re.sub(r"\s+", " ", str(value or "").strip()).lower()
     if key in {"(message)", "message"}:
         return " "
+    if album_count(key):
+        return "Photo"
     return PLACEHOLDERS.get(key, "")
 
 
@@ -1364,6 +1373,100 @@ def _coalesce_reactions(entries: list[dict]) -> list[dict]:
     return sorted(out.values(), key=lambda e: -e["count"])
 
 
+def _album_item(m: dict) -> dict:
+    return {
+        "id": m["id"],
+        "kind": m["kind"],
+        "ts": int(m.get("ts") or 0),
+        "fileUrl": m.get("fileUrl") or "",
+        "thumbUrl": m.get("thumbUrl") or "",
+        "localPath": m.get("localPath") or "",
+        "downloaded": bool(m.get("downloaded")),
+        "unavailable": bool(m.get("unavailable")),
+        "filename": m.get("filename") or "",
+        "mimeType": m.get("mimeType") or "",
+        "fileLength": int(m.get("fileLength") or 0),
+    }
+
+
+def fold_albums(items: list[dict]) -> list[dict]:
+    """Collapse consecutive album media into one bubble, WhatsApp-style.
+
+    A photo tagged `_album` (it followed an album stub) starts a group;
+    later tiles from the same sender within 3s join it. Untagged bursts
+    stay separate so two photos sent one-after-another don't merge.
+    ponytail: 3s is enough for a 4-image burst; widen if a real album splits.
+    """
+    out: list[dict] = []
+    i = 0
+    while i < len(items):
+        first = items[i]
+        tagged = bool(first.pop("_album", False))
+        if not tagged or first.get("kind") not in ALBUM_MEDIA:
+            out.append(first)
+            i += 1
+            continue
+        members = [first]
+        j = i + 1
+        while j < len(items):
+            nxt = items[j]
+            prev = members[-1]
+            if nxt.get("kind") not in ALBUM_MEDIA:
+                break
+            if nxt.get("_album"):
+                break
+            if nxt.get("quotedId") or nxt.get("senderJid") != first.get("senderJid"):
+                break
+            if nxt.get("fromMe") != first.get("fromMe"):
+                break
+            if int(nxt.get("ts") or 0) - int(prev.get("ts") or 0) > 3:
+                break
+            nxt.pop("_album", False)
+            members.append(nxt)
+            j += 1
+        if len(members) == 1:
+            out.append(first)
+            i = j
+            continue
+        merged = dict(first)
+        merged["album"] = [_album_item(m) for m in members]
+        cap = ""
+        for m in members:
+            cap = str(m.get("caption") or m.get("text") or "").strip()
+            if cap:
+                break
+        merged["caption"] = cap
+        merged["text"] = cap
+        reax: list[dict] = []
+        for m in members:
+            reax.extend(m.get("reactions") or [])
+        merged["reactions"] = _coalesce_reactions(reax)
+        merged["myReaction"] = next((e["emoji"] for e in merged["reactions"] if e["mine"]), "")
+        merged["downloaded"] = all(m.get("downloaded") for m in members)
+        out.append(merged)
+        i = j
+    return out
+
+
+def _fill_album_quotes(items: list[dict]) -> list[dict]:
+    """Quoted album stubs otherwise preview as 'Photo'; use the album caption."""
+    by_id: dict[str, dict] = {}
+    for m in items:
+        by_id[str(m.get("id") or "")] = m
+        if m.get("albumId"):
+            by_id[str(m["albumId"])] = m
+        for piece in m.get("album") or []:
+            by_id[str(piece.get("id") or "")] = m
+    for m in items:
+        target = by_id.get(str(m.get("quotedId") or ""))
+        if not target:
+            continue
+        cap = str(target.get("caption") or target.get("text") or "").strip()
+        if cap and (not m.get("quotedText") or m["quotedText"] in {"Photo", "Video", "GIF"}):
+            m["quotedText"] = cap[:280]
+    return items
+
+
 def list_messages(store: Path, jid: str, limit: int = 80, before: int | None = None) -> list[dict]:
     limit = max(1, min(int(limit), MAX_MESSAGES))
     con = open_db(store)
@@ -1404,7 +1507,7 @@ def list_messages(store: Path, jid: str, limit: int = 80, before: int | None = N
               AND IFNULL(m.deleted_for_me, 0) = 0
               AND IFNULL(m.reaction_to_id, '') = ''
               {clause}
-            ORDER BY m.ts DESC
+            ORDER BY m.ts DESC, m.rowid DESC
             LIMIT ?
             """,
             params,
@@ -1416,6 +1519,8 @@ def list_messages(store: Path, jid: str, limit: int = 80, before: int | None = N
     items = []
     pending_reax: list[dict] = []  # reactions from album-stub rows, awaiting a photo
     pending_sender = ""
+    pending_album = False
+    pending_album_id = ""
     # Album containers are stub rows immediately followed by their photos from
     # the same sender. Content-less stubs with no photo behind them are genuine
     # unsupported message types (e.g. PayPal templates): render a placeholder
@@ -1423,7 +1528,8 @@ def list_messages(store: Path, jid: str, limit: int = 80, before: int | None = N
     chrono = list(reversed(rows))
     album_stubs = set()
     for i, stub in enumerate(chrono):
-        if (stub["media_type"] or stub["text"] or stub["media_caption"]
+        labeled = album_count(stub["text"] or stub["display_text"] or "")
+        if not labeled and (stub["media_type"] or stub["text"] or stub["media_caption"]
                 or stub["loc_name"] or stub["revoked"] or stub["quoted_msg_id"]):
             continue
         for later in chrono[i + 1:]:
@@ -1450,21 +1556,40 @@ def list_messages(store: Path, jid: str, limit: int = 80, before: int | None = N
             quoted = placeholder_label(row["quoted_media"]) or quoted_kind
         sender_jid = row["sender_jid"] or ""
         quoted_jid = row["quoted_real_sender"] or row["quoted_sender_jid"] or ""
-        # WhatsApp album containers are stored as content-less stub rows; they'd
-        # render as blank bubbles. Drop them and carry any reaction (e.g. a heart
-        # on the album) onto the album's first photo from the same sender.
-        if not (text or caption or row["media_type"] or row["loc_name"]
+        labeled = album_count(row["text"] or row["display_text"] or "")
+        # WhatsApp album containers are stored as stub rows ([Album: N images]
+        # or a content-less "(message)"); they'd render as blank/[Album...]
+        # bubbles. Drop them and carry any reaction onto the first photo.
+        if labeled or not (text or caption or row["media_type"] or row["loc_name"]
                 or row["revoked"] or row["quoted_msg_id"]):
             if row["msg_id"] in album_stubs or reactions.get(row["msg_id"]):
                 pending_reax += reactions.get(row["msg_id"], [])
                 pending_sender = sender_jid
+                if row["msg_id"] in album_stubs:
+                    pending_album = True
+                    pending_album_id = row["msg_id"]
+                continue
+            if labeled:
                 continue
             text = "Unsupported message"
         row_reax = reactions.get(row["msg_id"], [])
         if pending_reax and sender_jid == pending_sender:
             row_reax = _coalesce_reactions(pending_reax + row_reax)
             pending_reax = []
+        tag_album = False
+        album_id = ""
+        if pending_album and sender_jid == pending_sender:
+            tag_album = kind in ALBUM_MEDIA
+            if tag_album:
+                album_id = pending_album_id
+            pending_album = False
+            pending_album_id = ""
         preview = attach_link_preview(text or caption, cache)
+        extra = {}
+        if tag_album:
+            extra["_album"] = True
+            if album_id:
+                extra["albumId"] = album_id
         items.append(
             {
                 "id": row["msg_id"],
@@ -1514,13 +1639,14 @@ def list_messages(store: Path, jid: str, limit: int = 80, before: int | None = N
                 "latitude": row["loc_lat"],
                 "longitude": row["loc_lng"],
                 "linkPreview": preview,
+                **extra,
             }
         )
     if pending_reax and items:  # stub was the newest row: fall back to the prior message
         merged = _coalesce_reactions(items[-1]["reactions"] + pending_reax)
         items[-1]["reactions"] = merged
         items[-1]["myReaction"] = next((e["emoji"] for e in merged if e["mine"]), "")
-    return items
+    return _fill_album_quotes(fold_albums(items))
 
 
 def list_participants(store: Path, jid: str) -> list[dict]:

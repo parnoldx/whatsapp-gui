@@ -445,18 +445,23 @@ void WhatsApp::apply(const Job &job, const QVariantMap &data) {
         if (oldStamp != messageStamp(m_messages))
             emit messagesChanged();
         const qint64 downloadCutoff = QDateTime::currentSecsSinceEpoch() - 7 * 86400;
-        for (const QVariant &item : m_messages) {
-            const QVariantMap msg = item.toMap();
+        auto considerDownload = [&](const QVariantMap &msg) {
             const QString msgId = msg.value(QStringLiteral("id")).toString();
             if (msg.value(QStringLiteral("kind")).toString() != QLatin1String("image"))
-                continue;
+                return;
             if (msg.value(QStringLiteral("downloaded")).toBool()
                 || msg.value(QStringLiteral("unavailable")).toBool()
                 || msg.value(QStringLiteral("ts")).toLongLong() <= downloadCutoff
                 || msgId.isEmpty() || m_autoDownloaded.contains(msgId))
-                continue;
+                return;
             m_autoDownloaded.insert(msgId);
             download(msg);
+        };
+        for (const QVariant &item : m_messages) {
+            const QVariantMap msg = item.toMap();
+            considerDownload(msg);
+            for (const QVariant &piece : msg.value(QStringLiteral("album")).toList())
+                considerDownload(piece.toMap());
         }
         if (!m_selectedJid.isEmpty())
             ackChat(m_selectedJid);
@@ -553,6 +558,9 @@ QString WhatsApp::messageStamp(const QVariantList &messages) {
         out += m.value(QStringLiteral("myReaction")).toString();
         out += QLatin1Char('|');
         out += QString::number(m.value(QStringLiteral("reactions")).toList().size());
+        out += QLatin1Char('|');
+        for (const QVariant &piece : m.value(QStringLiteral("album")).toList())
+            out += piece.toMap().value(QStringLiteral("downloaded")).toBool() ? QLatin1Char('d') : QLatin1Char('-');
         out += QLatin1Char('\n');
     }
     return out;
@@ -717,10 +725,7 @@ void WhatsApp::patchDownloaded(const QVariantMap &data) {
     const QString id = data.value(QStringLiteral("id")).toString();
     if (id.isEmpty())
         return;
-    for (int i = 0; i < m_messages.size(); ++i) {
-        QVariantMap msg = m_messages[i].toMap();
-        if (msg.value(QStringLiteral("id")).toString() != id)
-            continue;
+    auto apply = [&](QVariantMap &msg) {
         msg.insert(QStringLiteral("localPath"), data.value(QStringLiteral("localPath")));
         msg.insert(QStringLiteral("fileUrl"), data.value(QStringLiteral("fileUrl")));
         msg.insert(QStringLiteral("thumbUrl"), data.value(QStringLiteral("thumbUrl")));
@@ -728,6 +733,32 @@ void WhatsApp::patchDownloaded(const QVariantMap &data) {
         const QString filename = data.value(QStringLiteral("filename")).toString();
         if (!filename.isEmpty())
             msg.insert(QStringLiteral("filename"), filename);
+    };
+    for (int i = 0; i < m_messages.size(); ++i) {
+        QVariantMap msg = m_messages[i].toMap();
+        bool hit = msg.value(QStringLiteral("id")).toString() == id;
+        if (hit)
+            apply(msg);
+        QVariantList album = msg.value(QStringLiteral("album")).toList();
+        bool albumHit = false;
+        for (int j = 0; j < album.size(); ++j) {
+            QVariantMap piece = album[j].toMap();
+            if (piece.value(QStringLiteral("id")).toString() != id)
+                continue;
+            apply(piece);
+            album[j] = piece;
+            albumHit = true;
+        }
+        if (!hit && !albumHit)
+            continue;
+        if (albumHit) {
+            msg.insert(QStringLiteral("album"), album);
+            bool all = true;
+            for (const QVariant &piece : album)
+                all = all && piece.toMap().value(QStringLiteral("downloaded")).toBool();
+            if (all)
+                msg.insert(QStringLiteral("downloaded"), true);
+        }
         m_messages[i] = msg;
         emit messagesChanged();
         return;

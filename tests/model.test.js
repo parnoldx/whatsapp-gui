@@ -64,6 +64,20 @@ test("adoptThread switches chats immediately and keeps the same chat during refr
   assert.equal(Model.messageIds(shown), Model.messageIds(shown))
 })
 
+test("messageHasId matches the bubble, the album stub, or a tile", () => {
+  const album = {
+    id: "p1",
+    albumId: "s1",
+    album: [{ id: "p1" }, { id: "p2" }]
+  }
+  assert.equal(Model.messageHasId(album, "p1"), true)
+  assert.equal(Model.messageHasId(album, "s1"), true)
+  assert.equal(Model.messageHasId(album, "p2"), true)
+  assert.equal(Model.messageHasId(album, "nope"), false)
+  assert.equal(Model.messageHasId({ id: "x" }, "x"), true)
+  assert.equal(Model.messageHasId({ id: "x" }, "y"), false)
+})
+
 test("threadStamp changes when a patched field flips on the same id list", () => {
   const before = [{ id: "a1" }, { id: "a2", downloaded: false }]
   const afterDownload = [{ id: "a1" }, { id: "a2", downloaded: true }]
@@ -72,6 +86,9 @@ test("threadStamp changes when a patched field flips on the same id list", () =>
   assert.notEqual(Model.threadStamp(before), Model.threadStamp(afterDownload))
   assert.notEqual(Model.threadStamp(before), Model.threadStamp(afterReact))
   assert.equal(Model.threadStamp(before), Model.threadStamp(before))
+  const albumBefore = [{ id: "a1", album: [{ id: "p1", downloaded: false }, { id: "p2", downloaded: true }] }]
+  const albumAfter = [{ id: "a1", album: [{ id: "p1", downloaded: true }, { id: "p2", downloaded: true }] }]
+  assert.notEqual(Model.threadStamp(albumBefore), Model.threadStamp(albumAfter))
 })
 
 test("applyMyReaction adds, replaces, and clears the local reaction", () => {

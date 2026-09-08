@@ -124,6 +124,18 @@ function messageIds(messages) {
   return out.join("\n")
 }
 
+function messageHasId(m, id) {
+  var want = String(id || "")
+  if (!m || !want) return false
+  if (String(m.id || "") === want) return true
+  if (String(m.albumId || "") === want) return true
+  var album = asList(m.album)
+  for (var i = 0; i < album.length; i++) {
+    if (album[i] && String(album[i].id || "") === want) return true
+  }
+  return false
+}
+
 // Like messageIds, but also folds in the fields that get patched in place on an
 // otherwise-unchanged thread (download state, link-preview fetch, reactions), so
 // the view re-adopts when one of those flips instead of showing stale data.
@@ -134,7 +146,11 @@ function threadStamp(messages) {
     var m = list[i] || {}
     var rx = m.reactions && m.reactions.length ? m.reactions.length + ":" + String(m.myReaction || "") : ""
     var lp = m.linkPreview && (m.linkPreview.fetched || m.linkPreview.imageUrl) ? "p" : ""
-    out.push(String(m.id || "") + "|" + (m.downloaded ? "d" : "") + "|" + rx + "|" + lp)
+    var album = asList(m.album)
+    var al = ""
+    for (var a = 0; a < album.length; a++)
+      al += (album[a] && album[a].downloaded) ? "d" : "-"
+    out.push(String(m.id || "") + "|" + (m.downloaded ? "d" : "") + "|" + rx + "|" + lp + "|" + al)
   }
   return out.join("\n")
 }
@@ -507,6 +523,7 @@ if (typeof module !== "undefined" && module.exports) {
     badgeCount: badgeCount,
     adoptThread: adoptThread,
     messageIds: messageIds,
+    messageHasId: messageHasId,
     threadStamp: threadStamp,
     applyMyReaction: applyMyReaction,
     overlayMyReactions: overlayMyReactions,

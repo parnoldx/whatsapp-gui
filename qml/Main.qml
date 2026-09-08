@@ -355,9 +355,9 @@ ApplicationWindow {
     function focusMessage(id) {
         win.stickToEnd = false
         for (var i = 0; i < thread.count; i++) {
-            if (thread.model[i] && thread.model[i].id === id) {
+            if (Model.messageHasId(thread.model[i], id)) {
                 thread.positionViewAtIndex(i, ListView.Contain)
-                win.highlightId = id
+                win.highlightId = String((thread.model[i] && thread.model[i].id) || id)
                 highlightTimer.restart()
                 return
             }
@@ -639,7 +639,7 @@ ApplicationWindow {
                                 onPickReaction: function(msg) { win.pickReact(msg) }
                                 onJumpTo: function(id) { win.focusMessage(id) }
                                 onOpenLink: function(preview, external) { win.openLink(preview, external) }
-                                highlighted: modelData.id === win.highlightId
+                                highlighted: Model.messageHasId(modelData, win.highlightId)
                             }
                         }
                         Text {
