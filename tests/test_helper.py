@@ -185,6 +185,44 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(len(chats), 1)
         self.assertEqual(chats[0]["name"], "Crew")
 
+    def test_unsupported_stub_shows_but_album_stub_drops(self):
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO chats VALUES (?,?,?,?,?,?,?,?,?)",
+            ("666@s.whatsapp.net", "dm", "PayPal", 300, 0, 0, 0, 0, 1),
+        )
+
+        def msg(mid, ts, display="", media=""):
+            con.execute(
+                """INSERT INTO messages (
+                     chat_jid, chat_name, msg_id, sender_jid, sender_name, ts, from_me,
+                     text, display_text, quoted_msg_id, quoted_sender_jid, is_forwarded,
+                     forwarding_score, reaction_to_id, reaction_emoji, media_type,
+                     media_caption, filename, mime_type, file_length, local_path,
+                     downloaded_at, media_unavailable_at, revoked, deleted_for_me,
+                     edited, buttons
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    "666@s.whatsapp.net", "PayPal", mid, "666@s.whatsapp.net", "PayPal",
+                    ts, 0, "", display, "", "", 0, 0, "", "", media, "", "", "", 0, "",
+                    0, 0, 0, 0, 0, "",
+                ),
+            )
+
+        # Lone "(message)" stub = unsupported message type: must render.
+        msg("t1", 300, display="(message)")
+        # Album container followed by its photo from the same sender: must drop.
+        msg("a1", 200, display="(message)")
+        msg("a2", 201, media="image")
+        con.commit()
+        con.close()
+        code, payload = run_helper(["messages", "--chat", "666@s.whatsapp.net"], self.env)
+        self.assertEqual(code, 0)
+        messages = payload["data"]["messages"]
+        self.assertEqual([m["id"] for m in messages], ["a2", "t1"])
+        stub = next(m for m in messages if m["id"] == "t1")
+        self.assertEqual(stub["text"], "Unsupported message")
+
     def test_messages_skip_deleted_and_expose_links(self):
         code, payload = run_helper(["messages", "--chat", "111@s.whatsapp.net"], self.env)
         self.assertEqual(code, 0)
@@ -449,6 +487,36 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(preview["site"], "Instagram")
         self.assertEqual(preview["label"], "Reel")
         self.assertIn("instagram.com/reel/", preview["url"])
+        self.assertEqual(preview["embedUrl"], "https://www.instagram.com/reel/Dc66-wqjore/embed/")
+
+    def test_describe_link_builds_official_embed_urls(self):
+        ig = self.mod.describe_link("https://www.instagram.com/p/Dc9x-rfASm0/?img_index=1")
+        self.assertEqual(ig["embedUrl"], "https://www.instagram.com/p/Dc9x-rfASm0/embed/")
+        tt = self.mod.describe_link(
+            "https://www.tiktok.com/@_omarreacts/video/7662159610396052757?_r=1"
+        )
+        self.assertEqual(tt["embedUrl"], "https://www.tiktok.com/embed/v2/7662159610396052757")
+        self.assertEqual(self.mod.describe_link("https://vm.tiktok.com/ZGdxcYD6r/")["embedUrl"], "")
+        self.assertEqual(
+            self.mod.describe_link("https://www.tiktok.com/@x/photo/7662159610396052757")["embedUrl"],
+            "https://www.tiktok.com/embed/v2/7662159610396052757",
+        )
+        yt = self.mod.describe_link("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=4")
+        self.assertEqual(yt["embedUrl"], "https://www.youtube.com/embed/dQw4w9WgXcQ")
+        fb = self.mod.describe_link("https://www.facebook.com/share/r/18KkbJYRmm/")
+        self.assertEqual(fb["embedUrl"], "")
+        reel = self.mod.describe_link("https://www.facebook.com/reel/2257374628373907/?fs=e")
+        self.assertEqual(
+            reel["embedUrl"],
+            "https://www.facebook.com/plugins/video.php?href="
+            "https%3A%2F%2Fwww.facebook.com%2Freel%2F2257374628373907%2F&show_text=false",
+        )
+        tweet = self.mod.describe_link("https://x.com/BarackObama/status/266031293945503744?s=20")
+        self.assertEqual(
+            tweet["embedUrl"],
+            "https://platform.twitter.com/embed/Tweet.html?id=266031293945503744&dnt=true&theme=dark",
+        )
+        self.assertEqual(self.mod.describe_link("https://example.com/x")["embedUrl"], "")
 
     def test_prune_media_drops_only_old_files(self):
         import time

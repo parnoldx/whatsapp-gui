@@ -13,7 +13,10 @@ Item {
     signal reply(var message)
     signal react(var message, string emoji)
     signal pickReaction(var message)
+    signal jumpTo(string messageId)
+    signal openLink(var preview, bool external)
 
+    property bool highlighted: false
     property bool reactOpen: false
     readonly property string messageId: (message && message.id) ? message.id : ""
     onMessageIdChanged: reactOpen = false
@@ -25,12 +28,25 @@ Item {
         var fromMsg = message && message.linkPreview
         var parsed = fromMsg && fromMsg.url ? fromMsg : Model.parseLink((message && (message.text || message.caption)) || "")
         var url = parsed && parsed.url ? parsed.url : ""
-        if (url && WhatsApp.linkPreviews && WhatsApp.linkPreviews[url])
-            return WhatsApp.linkPreviews[url]
-        return parsed
+        var fetched = (url && WhatsApp.linkPreviews && WhatsApp.linkPreviews[url]) ? WhatsApp.linkPreviews[url] : null
+        if (!fetched)
+            return parsed
+        var copy = {}
+        var k
+        if (parsed)
+            for (k in parsed) copy[k] = parsed[k]
+        for (k in fetched)
+            if (fetched[k] !== undefined && fetched[k] !== "")
+                copy[k] = fetched[k]
+        if (parsed && parsed.url)
+            copy.url = parsed.url
+        if (parsed && parsed.host)
+            copy.host = parsed.host
+        return copy
     }
     readonly property bool urlOnly: !!(preview && preview.url
         && Model.textIsOnlyUrl((message && (message.text || message.caption)) || "", preview.url))
+    readonly property string embedUrl: Model.linkEmbed(preview)
     readonly property var palette: Theme.avatarPalette
 
     implicitHeight: col.implicitHeight
@@ -70,6 +86,9 @@ Item {
             radius: Theme.radiusSmall
             color: fromMe ? Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.18)
                           : Qt.rgba(Theme.foreground.r, Theme.foreground.g, Theme.foreground.b, 0.08)
+            border.width: root.highlighted ? 2 : 0
+            border.color: Theme.accent
+            Behavior on border.width { NumberAnimation { duration: 150 } }
 
             Column {
                 id: inner
@@ -85,6 +104,11 @@ Item {
                     height: quoteCol.implicitHeight + 8
                     radius: Theme.radiusSmall
                     color: Qt.rgba(Theme.foreground.r, Theme.foreground.g, Theme.foreground.b, 0.08)
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: if (message && message.quotedId) root.jumpTo(message.quotedId)
+                    }
                     Column {
                         id: quoteCol
                         anchors.left: parent.left
@@ -235,7 +259,10 @@ Item {
                     color: Theme.textPrimary
                     font.family: Theme.fontFamily
                     font.pixelSize: 13
-                    onLinkActivated: function(link) { Qt.openUrlExternally(link) }
+                    onLinkActivated: function(link) {
+                        var parsed = Model.parseLink(link)
+                        root.openLink(parsed && parsed.url ? parsed : { url: link }, false)
+                    }
                 }
 
                 Rectangle {
@@ -323,7 +350,32 @@ Item {
                     }
                     MouseArea {
                         anchors.fill: parent
-                        onClicked: if (preview && preview.url) Qt.openUrlExternally(preview.url)
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: if (preview && preview.url) root.openLink(preview, false)
+                    }
+                    Rectangle {
+                        visible: !!root.embedUrl
+                        anchors.top: parent.top
+                        anchors.right: parent.right
+                        anchors.margins: 8
+                        z: 3
+                        width: 28
+                        height: 28
+                        radius: 14
+                        color: Qt.rgba(0, 0, 0, 0.55)
+                        Text {
+                            anchors.centerIn: parent
+                            text: "\uF08E"
+                            textFormat: Text.PlainText
+                            color: "#ffffff"
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 13
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: if (preview && preview.url) root.openLink(preview, true)
+                        }
                     }
                 }
 

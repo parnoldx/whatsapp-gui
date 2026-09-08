@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Network Qml Quick QuickControls2 Multimedia)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Network Qml Quick QuickControls2 Multimedia WebEngineQuick)
 
 qt_add_executable(whatsapp-gui
     src/main.cpp
@@ -28,7 +28,7 @@ qt_add_resources(whatsapp-gui "qml"
 
 target_include_directories(whatsapp-gui PRIVATE src)
 target_link_libraries(whatsapp-gui PRIVATE
-    Qt6::Core Qt6::Gui Qt6::Network Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Multimedia)
+    Qt6::Core Qt6::Gui Qt6::Network Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Multimedia Qt6::WebEngineQuick)
 
 include(GNUInstallDirs)
 install(TARGETS whatsapp-gui RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

@@ -748,7 +748,11 @@ void WhatsApp::patchLinkPreview(const QVariantMap &data) {
 void WhatsApp::fetchLinkPreview(const QString &url) {
     if (url.isEmpty() || m_previewPending.contains(url))
         return;
-    if (m_previewCache.contains(url))
+    const QString cachedEmbed = m_previewCache.value(url).toMap().value(QStringLiteral("embedUrl")).toString();
+    const bool usable = !cachedEmbed.isEmpty()
+        && !cachedEmbed.contains(QLatin1String("share"))
+        && !cachedEmbed.contains(QLatin1String("embed/v3"));
+    if (m_previewCache.contains(url) && usable)
         return;
     m_previewPending.insert(url);
     call({QStringLiteral("link-preview"), QStringLiteral("--url"), url}, QStringLiteral("link-preview"));

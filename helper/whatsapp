@@ -302,7 +302,7 @@ def human_preview(raw: str) -> str:
     if mapped:
         return mapped[:180]
     if placeholder_label(last):
-        return ""
+        return "Unsupported message"
     url = first_url(text)
     if url:
         preview = describe_link(url)
@@ -341,14 +341,117 @@ def first_url(text: str) -> str:
     return match.group(0).rstrip(").,;:!?]}")
 
 
+def canonical_host(host: str) -> str:
+    h = (host or "").lower()
+    if h.startswith("www."):
+        h = h[4:]
+    return {
+        "m.instagram.com": "instagram.com",
+        "m.facebook.com": "facebook.com",
+        "web.facebook.com": "facebook.com",
+        "m.tiktok.com": "tiktok.com",
+        "vt.tiktok.com": "vm.tiktok.com",
+        "mobile.twitter.com": "twitter.com",
+    }.get(h, h)
+
+
+def embed_url_for(host: str, url: str) -> str:
+    raw = str(url or "").strip()
+    h = canonical_host(host)
+    if not h and raw:
+        h = canonical_host(urlparse(raw).hostname or "")
+    path = urlparse(raw).path or ""
+    if h == "instagram.com":
+        match = re.search(r"/(reel|p|tv)/([^/?#]+)", path)
+        return f"https://www.instagram.com/{match.group(1)}/{match.group(2)}/embed/" if match else ""
+    if h == "tiktok.com":
+        match = re.search(r"/(?:video|photo|v)/(\d+)", path) or re.search(
+            r"/embed/(?:v2|v3)/(\d+)", path
+        )
+        return f"https://www.tiktok.com/embed/v2/{match.group(1)}" if match else ""
+    if h in {"youtube.com", "youtu.be", "m.youtube.com"}:
+        vid = ""
+        if h == "youtu.be":
+            vid = path.lstrip("/").split("/")[0]
+        if not vid:
+            match = re.search(r"/(?:embed|shorts|live)/([^/?#]+)", path)
+            if match:
+                vid = match.group(1)
+        if not vid:
+            match = re.search(r"[?&]v=([^&?#]+)", raw)
+            if match:
+                vid = match.group(1)
+        return f"https://www.youtube.com/embed/{vid}" if vid else ""
+    if h in {"x.com", "twitter.com"}:
+        match = re.search(r"/(?:i/web/)?status/(\d+)", path)
+        return (
+            f"https://platform.twitter.com/embed/Tweet.html?id={match.group(1)}&dnt=true&theme=dark"
+            if match
+            else ""
+        )
+    if h in {"facebook.com", "fb.watch"}:
+        parsed = urlparse(raw)
+        if h == "facebook.com" and re.search(r"/share/[rv]/", parsed.path or ""):
+            return ""
+        canonical = parsed._replace(query="", fragment="").geturl()
+        if h == "facebook.com":
+            canonical = "https://www.facebook.com" + (parsed.path or "/")
+        return (
+            "https://www.facebook.com/plugins/video.php?href="
+            + quote(canonical, safe="")
+            + "&show_text=false"
+            if canonical
+            else ""
+        )
+    return ""
+
+
+def embed_usable(url: str) -> bool:
+    text = str(url or "")
+    if not text:
+        return False
+    if "plugins/video.php" in text and "share" in text:
+        return False
+    return True
+
+
+def resolve_with_ytdlp(url: str, host: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    ytdlp = shutil.which("yt-dlp")
+    if not ytdlp:
+        return ""
+    try:
+        proc = subprocess.run(
+            [ytdlp, "--no-download", "--print", "%(id)s", "--no-warnings", raw],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    vid = (proc.stdout or "").strip().splitlines()
+    vid = vid[-1].strip() if vid else ""
+    if not vid or " " in vid or len(vid) > 32:
+        return ""
+    if host in {"facebook.com", "fb.watch"} or vid.isdigit() and "facebook" in raw:
+        if vid.isdigit():
+            return embed_url_for("facebook.com", f"https://www.facebook.com/reel/{vid}/")
+    if host in {"tiktok.com", "vm.tiktok.com"} or "tiktok" in raw:
+        if vid.isdigit():
+            return f"https://www.tiktok.com/embed/v2/{vid}"
+    found = embed_url_for("", f"https://www.tiktok.com/@x/video/{vid}") if vid.isdigit() else ""
+    return found
+
+
 def describe_link(url: str) -> dict:
     raw = str(url or "").strip()
     if not raw:
         return {}
     parsed = urlparse(raw)
-    host = (parsed.hostname or "").lower()
-    if host.startswith("www."):
-        host = host[4:]
+    host = canonical_host(parsed.hostname or "")
     path = parsed.path or ""
     site = host
     label = host
@@ -380,6 +483,7 @@ def describe_link(url: str) -> dict:
         "title": label,
         "description": "",
         "imageUrl": "",
+        "embedUrl": embed_url_for(host, raw),
         "fetched": False,
     }
 
@@ -440,7 +544,7 @@ def _meta_og(page: str) -> dict:
     out: dict[str, str] = {}
     for tag in re.findall(r"<meta\b[^>]*>", page, re.I):
         prop = re.search(
-            r"""(?:property|name)\s*=\s*['"](?:og|twitter):(title|description|image(?::secure_url)?)['"]""",
+            r"""(?:property|name)\s*=\s*['"](?:og|twitter):(title|description|image(?::secure_url)?|url)['"]""",
             tag,
             re.I,
         )
@@ -513,6 +617,10 @@ def fetch_og(url: str) -> dict:
     image = _http_url(image)
     title = (og.get("title") or "").strip()
     description = (og.get("description") or "").strip()
+    canonical = (og.get("url") or "").strip()
+    if canonical.startswith("//"):
+        canonical = "https:" + canonical
+    canonical = _http_url(canonical) if canonical.startswith("http") else ""
     out = {}
     if title:
         out["title"] = title[:180]
@@ -520,6 +628,10 @@ def fetch_og(url: str) -> dict:
         out["description"] = description[:240]
     if image:
         out["imageUrl"] = image
+    if canonical:
+        out["canonicalUrl"] = canonical
+    if final:
+        out["finalUrl"] = final
     return out
 
 
@@ -550,6 +662,18 @@ def fetch_oembed(url: str, host: str) -> dict:
         out["description"] = author[:240]
     if thumb:
         out["imageUrl"] = thumb
+    vid = str(data.get("embed_product_id") or "").strip()
+    if not vid:
+        html_embed = str(data.get("html") or "")
+        found = re.search(r'data-video-id="(\d+)"', html_embed)
+        if found:
+            vid = found.group(1)
+    if vid.isdigit():
+        out["embedUrl"] = f"https://www.tiktok.com/embed/v2/{vid}"
+    if not out.get("embedUrl"):
+        found = embed_url_for("", str(data.get("url") or url))
+        if found:
+            out["embedUrl"] = found
     return out
 
 
@@ -591,6 +715,17 @@ def fetch_social_preview(url: str, host: str) -> dict:
         out["description"] = og["description"]
     if og.get("imageUrl") and not out.get("imageUrl"):
         out["imageUrl"] = og["imageUrl"]
+    if not embed_usable(out.get("embedUrl") or ""):
+        out.pop("embedUrl", None)
+        for candidate in (og.get("canonicalUrl") or "", og.get("finalUrl") or "", url):
+            found = embed_url_for("", candidate)
+            if embed_usable(found):
+                out["embedUrl"] = found
+                break
+    if not embed_usable(out.get("embedUrl") or ""):
+        found = resolve_with_ytdlp(url, host)
+        if found:
+            out["embedUrl"] = found
     image = out.get("imageUrl") or ""
     if image:
         local = cache_remote_image(image, url)
@@ -608,11 +743,22 @@ def cmd_link_preview(url: str) -> dict:
     cached = cache.get(target)
     if isinstance(cached, dict) and (cached.get("title") or cached.get("imageUrl")):
         preview.update({k: cached[k] for k in ("title", "description", "imageUrl") if cached.get(k)})
+        cached_embed = str(cached.get("embedUrl") or "")
+        if not embed_usable(preview.get("embedUrl") or "") and embed_usable(cached_embed):
+            preview["embedUrl"] = cached_embed
+        if not embed_usable(preview.get("embedUrl") or ""):
+            fetched = fetch_social_preview(target, preview.get("host") or "")
+            if embed_usable(fetched.get("embedUrl") or ""):
+                preview["embedUrl"] = fetched["embedUrl"]
+                cached = dict(cached)
+                cached["embedUrl"] = fetched["embedUrl"]
+                cache[target] = cached
+                save_link_cache(cache)
         preview["fetched"] = True
         return preview
     fetched = fetch_social_preview(target, preview.get("host") or "")
     if fetched:
-        keep = {k: fetched[k] for k in ("title", "description", "imageUrl") if fetched.get(k)}
+        keep = {k: fetched[k] for k in ("title", "description", "imageUrl", "embedUrl") if fetched.get(k)}
         cache[target] = keep
         if len(cache) > 400:
             keys = list(cache.keys())
@@ -634,6 +780,8 @@ def attach_link_preview(text: str, cache: dict | None = None) -> dict:
         for key in ("title", "description", "imageUrl"):
             if cached.get(key):
                 preview[key] = cached[key]
+        if embed_usable(str(cached.get("embedUrl") or "")):
+            preview["embedUrl"] = cached["embedUrl"]
         if cached.get("title") or cached.get("imageUrl"):
             preview["fetched"] = True
     return preview
@@ -1268,6 +1416,22 @@ def list_messages(store: Path, jid: str, limit: int = 80, before: int | None = N
     items = []
     pending_reax: list[dict] = []  # reactions from album-stub rows, awaiting a photo
     pending_sender = ""
+    # Album containers are stub rows immediately followed by their photos from
+    # the same sender. Content-less stubs with no photo behind them are genuine
+    # unsupported message types (e.g. PayPal templates): render a placeholder
+    # bubble instead of dropping them, or the thread shows up empty.
+    chrono = list(reversed(rows))
+    album_stubs = set()
+    for i, stub in enumerate(chrono):
+        if (stub["media_type"] or stub["text"] or stub["media_caption"]
+                or stub["loc_name"] or stub["revoked"] or stub["quoted_msg_id"]):
+            continue
+        for later in chrono[i + 1:]:
+            if later["sender_jid"] != stub["sender_jid"]:
+                continue
+            if int(later["ts"] or 0) - int(stub["ts"] or 0) <= 120 and later["media_type"]:
+                album_stubs.add(stub["msg_id"])
+            break
     for row in reversed(rows):
         kind = media_kind(row["media_type"], row["mime_type"])
         text, caption = visible_body(row["display_text"] or "", row["text"] or "", row["media_caption"] or "", kind)
@@ -1291,9 +1455,11 @@ def list_messages(store: Path, jid: str, limit: int = 80, before: int | None = N
         # on the album) onto the album's first photo from the same sender.
         if not (text or caption or row["media_type"] or row["loc_name"]
                 or row["revoked"] or row["quoted_msg_id"]):
-            pending_reax += reactions.get(row["msg_id"], [])
-            pending_sender = sender_jid
-            continue
+            if row["msg_id"] in album_stubs or reactions.get(row["msg_id"]):
+                pending_reax += reactions.get(row["msg_id"], [])
+                pending_sender = sender_jid
+                continue
+            text = "Unsupported message"
         row_reax = reactions.get(row["msg_id"], [])
         if pending_reax and sender_jid == pending_sender:
             row_reax = _coalesce_reactions(pending_reax + row_reax)

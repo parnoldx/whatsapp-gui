@@ -3,6 +3,7 @@ import QtQuick.Controls.Basic
 import QtQuick.Layouts
 import QtMultimedia
 import QtQuick.Window
+import QtWebEngine
 import "Model.js" as Model
 
 ApplicationWindow {
@@ -22,7 +23,6 @@ ApplicationWindow {
     property var viewer: null
     property bool stickToEnd: true
     property bool pinning: false
-    property string anchorId: ""
     property real anchorY: 0
     property var shownMessages: []
     property string shownJid: ""
@@ -30,6 +30,7 @@ ApplicationWindow {
     property var pendingReactions: ({})
     property var pendingSends: []
     property var pendingReactMsg: null
+    property string highlightId: ""
     readonly property var chats: Model.filterChats(WhatsApp.chats, query)
     readonly property var chat: WhatsApp.selectedChat
     readonly property var threadMessages: shownMessages
@@ -63,7 +64,6 @@ ApplicationWindow {
 
     function goToNewest() {
         win.stickToEnd = true
-        win.anchorId = ""
         if (!thread.count) {
             win.pinning = false
             return
@@ -140,17 +140,9 @@ ApplicationWindow {
     }
 
     function captureAnchor() {
-        if (pinning || stickToEnd || !thread.count) {
-            if (stickToEnd)
-                anchorId = ""
+        if (pinning || stickToEnd || !thread.count)
             return
-        }
         anchorY = thread.contentY
-        var idx = thread.indexAt(thread.width / 2, thread.contentY + 24)
-        if (idx < 0)
-            idx = thread.indexAt(thread.width / 2, thread.contentY + 80)
-        var item = idx >= 0 ? thread.model[idx] : null
-        anchorId = item && item.id ? item.id : anchorId
     }
 
     function restoreAnchor() {
@@ -163,25 +155,219 @@ ApplicationWindow {
             return
         }
         win.pinning = true
-        if (anchorId) {
-            var list = thread.model
-            var n = thread.count
-            for (var i = 0; i < n; i++) {
-                var item = list[i]
-                if (item && item.id === anchorId) {
-                    thread.positionViewAtIndex(i, ListView.Contain)
-                    Qt.callLater(function() { win.pinning = false })
-                    return
-                }
-            }
-        }
         thread.contentY = anchorY
-        Qt.callLater(function() { win.pinning = false })
+        // ponytail: re-assert for 500ms since async image heights settle after the model swap;
+        // replace with a proper item anchor if content keeps shifting
+        restoreTimer.tries = 0
+        restoreTimer.restart()
+    }
+
+    Timer {
+        id: restoreTimer
+        interval: 33
+        repeat: true
+        property int tries: 0
+        onTriggered: {
+            tries += 1
+            if (tries > 15 || thread.moving) {
+                stop()
+                win.pinning = false
+                return
+            }
+            thread.contentY = win.anchorY
+        }
     }
 
     function closeViewer() {
         player.stop()
         win.viewer = null
+    }
+
+    WebEngineProfile {
+        id: embedProfile
+        storageName: "whatsapp-link-embed"
+        offTheRecord: false
+        persistentCookiesPolicy: WebEngineProfile.ForcePersistentCookies
+        Component.onCompleted: {
+            var prep = WebEngine.script()
+            prep.name = "tiktok-embed-prep"
+            prep.injectionPoint = WebEngineScript.DocumentCreation
+            prep.worldId = WebEngineScript.MainWorld
+            prep.runsOnSubFrames = true
+            prep.sourceCode = win.tiktokPrepScript()
+            userScripts.insert(prep)
+            var ready = WebEngine.script()
+            ready.name = "tiktok-embed-ready"
+            ready.injectionPoint = WebEngineScript.DocumentReady
+            ready.worldId = WebEngineScript.MainWorld
+            ready.runsOnSubFrames = true
+            ready.sourceCode = win.tiktokReadyScript()
+            userScripts.insert(ready)
+        }
+    }
+
+    function embedWatchUrl(url) {
+        var u = String(url || "").replace("/embed/v3/", "/embed/v2/")
+        if (!u)
+            return u
+        if (u.indexOf("youtube.com/embed/") !== -1 && u.indexOf("autoplay=") === -1)
+            return u + (u.indexOf("?") >= 0 ? "&" : "?") + "autoplay=1"
+        if (u.indexOf("tiktok.com/embed/") !== -1 && u.indexOf("autoplay=") === -1)
+            return u + (u.indexOf("?") >= 0 ? "&" : "?") + "autoplay=1"
+        if (u.indexOf("facebook.com/plugins/video.php") !== -1) {
+            if (u.indexOf("autoplay=") === -1)
+                u += "&autoplay=true"
+            if (u.indexOf("mute=") === -1)
+                u += "&mute=0"
+            if (u.indexOf("width=") === -1)
+                u += "&width=500"
+            return u
+        }
+        return u
+    }
+
+    function isEmbedPlayer(url) {
+        var u = String(url || "")
+        return u.indexOf("/embed") !== -1
+            || u.indexOf("plugins/video.php") !== -1
+            || u.indexOf("Tweet.html") !== -1
+            || u.indexOf("youtube.com/embed/") !== -1
+    }
+
+    function tiktokPrepScript() {
+        return "(function(){if(String(location.hostname).indexOf('tiktok')<0)return;"
+            + "try{document.cookie='cookie-consent=essential;domain=.tiktok.com;path=/;max-age=31536000;SameSite=Lax';"
+            + "document.cookie='tt_cookie_policy=essential;domain=.tiktok.com;path=/;max-age=31536000;SameSite=Lax'}catch(e){}"
+            + "var s=document.createElement('style');s.id='wa-tt-prep';"
+            + "s.textContent='html,body,#root{margin:0!important;width:100%!important;height:100%!important;overflow:hidden!important;background:#000!important}"
+            + "tiktok-cookie-banner,[class*=\"CookieBanner\"],[id*=\"cookie-banner\"],[class*=\"cookie-banner\"]{display:none!important;height:0!important;visibility:hidden!important}"
+            + "[aria-label=\"Play\"],[aria-label=\"Play video\"],[data-e2e*=\"play-icon\"],[class*=\"PlayIcon\"],[class*=\"BigPlay\"]{display:none!important}"
+            + "[class*=\"PlayIconContainer\"],[class*=\"DivPlayIcon\"],[class*=\"VideoOverlay\"],[class*=\"play-overlay\"]{background:transparent!important;background-color:transparent!important}"
+            + "[class*=\"PlayIconContainer\"]::before,[class*=\"PlayIconContainer\"]::after,[class*=\"DivPlayIcon\"]::before,[class*=\"DivPlayIcon\"]::after{display:none!important;background:none!important}';"
+            + "(document.documentElement||document.head).appendChild(s)})()"
+    }
+
+    function tiktokReadyScript() {
+        return "(function(){if(String(location.hostname).indexOf('tiktok')<0)return;"
+            + "function fill(){var v=document.querySelector('video');if(!v)return;"
+            + "var el=v;while(el&&el!==document.documentElement){el.style.setProperty('width','100%','important');"
+            + "el.style.setProperty('height','100%','important');el.style.setProperty('max-width','none','important');"
+            + "el.style.setProperty('max-height','none','important');el=el.parentElement}}"
+            + "function hidePlay(){var v=document.querySelector('video');if(!v||v.paused)return;"
+            + "var vr=v.getBoundingClientRect();var cx=vr.left+vr.width/2,cy=vr.top+vr.height/2;"
+            + "var nodes=document.querySelectorAll('div,span,button,section,a,svg');"
+            + "for(var i=0;i<nodes.length;i++){var el=nodes[i];if(el===v||(el.querySelector&&el.querySelector('video')))continue;"
+            + "var a=((el.getAttribute&&el.getAttribute('aria-label'))||'').toLowerCase();"
+            + "if(a==='play'||a==='play video'){el.style.setProperty('display','none','important');continue}"
+            + "var r=el.getBoundingClientRect();if(r.width<8||r.height<8)continue;"
+            + "if(r.width>=48&&r.width<=140&&r.height>=48&&r.height<=140&&Math.abs(r.left+r.width/2-cx)<50&&Math.abs(r.top+r.height/2-cy)<50)"
+            + "{el.style.setProperty('display','none','important');continue}"
+            + "if(r.width<vr.width*0.8||r.height<vr.height*0.8)continue;"
+            + "if(Math.abs(r.left+r.width/2-cx)>vr.width*0.15||Math.abs(r.top+r.height/2-cy)>vr.height*0.15)continue;"
+            + "if((el.innerText||'').trim().length>24)continue;"
+            + "var st=getComputedStyle(el);var bg=st.backgroundColor||'';"
+            + "var m=bg.match(/rgba?\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)(?:\\s*,\\s*([0-9.]+))?\\s*\\)/);"
+            + "var alpha=m&&m[4]!=null?parseFloat(m[4]):1;"
+            + "var dark=m&&+m[1]<70&&+m[2]<70&&+m[3]<70;"
+            + "var pos=st.position;var overlay=pos==='absolute'||pos==='fixed'||(dark&&alpha>0&&alpha<1);"
+            + "if(!overlay&&st.backgroundImage==='none')continue;"
+            + "el.style.setProperty('background','transparent','important');"
+            + "el.style.setProperty('background-color','transparent','important');"
+            + "el.style.setProperty('background-image','none','important');"
+            + "el.style.setProperty('box-shadow','none','important');"
+            + "el.style.setProperty('backdrop-filter','none','important')}}"
+            + "function nuke(){var nodes=document.querySelectorAll('tiktok-cookie-banner,[class*=\"CookieBanner\"],[id*=\"cookie-banner\"]');"
+            + "for(var i=0;i<nodes.length;i++)nodes[i].remove();"
+            + "var all=document.querySelectorAll('div,section,aside,dialog');"
+            + "for(var j=0;j<all.length;j++){var el=all[j];if(el.querySelector&&el.querySelector('video'))continue;"
+            + "if((el.textContent||'').toLowerCase().indexOf('allow cookies from tiktok')!==-1)el.remove()}"
+            + "var btns=document.querySelectorAll('button,[role=button]');"
+            + "for(var k=0;k<btns.length;k++){var x=(btns[k].textContent||'').replace(/\\s+/g,' ').trim().toLowerCase();"
+            + "if(x==='decline optional cookies'||x==='allow all')btns[k].click()}}"
+            + "function bind(){var vs=document.querySelectorAll('video');for(var i=0;i<vs.length;i++){"
+            + "if(vs[i].dataset.waPlay)continue;vs[i].dataset.waPlay='1';"
+            + "vs[i].addEventListener('play',hidePlay);vs[i].addEventListener('playing',hidePlay)}}"
+            + "var busy=false;function go(){if(busy)return;busy=true;try{nuke();fill();bind();hidePlay()}finally{busy=false}}"
+            + "go();new MutationObserver(go).observe(document.documentElement,{childList:true,subtree:true})})()"
+    }
+
+    function embedKickScript() {
+        return "(function(){function play(r){var ok=false;if(!r||!r.querySelectorAll)return ok;"
+            + "var vs=r.querySelectorAll('video');"
+            + "for(var k=0;k<vs.length;k++){var v=vs[k];v.playsInline=true;v.defaultMuted=false;v.muted=false;v.volume=1;"
+            + "var p=v.play();if(p&&p.catch)p.catch(function(){});if(!v.paused&&!v.muted)ok=true}"
+            + "var b=r.querySelector('[aria-label=\"Play\"],[aria-label=\"Play video\"]');if(b)b.click();return ok}"
+            + "var playing=play(document);"
+            + "try{var f=document.querySelectorAll('iframe');for(var j=0;j<f.length;j++){var d=f[j].contentDocument;if(d&&play(d))playing=true}}catch(e){}"
+            + "return playing})()"
+    }
+
+    function showEmbed(preview, embed) {
+        player.stop()
+        win.viewer = {
+            kind: "embed",
+            embedUrl: embed || "",
+            pageUrl: preview.url,
+            filename: preview.title || preview.site || preview.label || "Link",
+            failed: false
+        }
+        if (embed)
+            embedWait.stop()
+        else
+            embedWait.restart()
+    }
+
+    Timer {
+        id: embedWait
+        interval: 20000
+        onTriggered: {
+            if (win.viewer && win.viewer.kind === "embed" && !win.viewer.embedUrl)
+                win.viewer = {
+                    kind: "embed",
+                    embedUrl: "",
+                    pageUrl: win.viewer.pageUrl,
+                    filename: win.viewer.filename,
+                    failed: true
+                }
+        }
+    }
+
+    function openLink(preview, external) {
+        if (!preview || !preview.url)
+            return
+        if (external) {
+            Qt.openUrlExternally(preview.url)
+            return
+        }
+        var embed = Model.linkEmbed(preview)
+        if (embed) {
+            win.showEmbed(preview, embed)
+            return
+        }
+        if (Model.needsEmbedResolve(preview)) {
+            win.showEmbed(preview, "")
+            WhatsApp.fetchLinkPreview(preview.url)
+            return
+        }
+        Qt.openUrlExternally(preview.url)
+    }
+
+    function focusMessage(id) {
+        win.stickToEnd = false
+        for (var i = 0; i < thread.count; i++) {
+            if (thread.model[i] && thread.model[i].id === id) {
+                thread.positionViewAtIndex(i, ListView.Contain)
+                win.highlightId = id
+                highlightTimer.restart()
+                return
+            }
+        }
+    }
+
+    Timer {
+        id: highlightTimer
+        interval: 2000
+        onTriggered: win.highlightId = ""
     }
 
     function showAndRaise() {
@@ -200,6 +386,12 @@ ApplicationWindow {
         onActivated: Shell.quit()
     }
 
+    Shortcut {
+        sequences: ["Ctrl+E"]
+        enabled: !!win.chat
+        onActivated: win.goToNewest()
+    }
+
     Connections {
         target: Shell
         function onToggleRequested() {
@@ -216,7 +408,6 @@ ApplicationWindow {
         target: WhatsApp
         function onSelectedJidChanged() {
             win.stickToEnd = true
-            win.anchorId = ""
             win.anchorY = 0
             win.shownMessages = []
             win.shownJid = ""
@@ -228,6 +419,21 @@ ApplicationWindow {
         function onMessagesChanged() {
             win.adoptMessages()
         }
+        function onLinkPreviewsChanged() {
+            if (!win.viewer || win.viewer.kind !== "embed" || win.viewer.embedUrl)
+                return
+            var page = win.viewer.pageUrl
+            var fetched = (page && WhatsApp.linkPreviews) ? WhatsApp.linkPreviews[page] : null
+            var embed = Model.linkEmbed({
+                url: page,
+                host: fetched && fetched.host ? fetched.host : "",
+                embedUrl: fetched && fetched.embedUrl ? fetched.embedUrl : ""
+            })
+            if (embed) {
+                embedWait.stop()
+                win.showEmbed({ url: page, title: win.viewer.filename }, embed)
+            }
+        }
     }
 
     VoiceRecorder { id: voice }
@@ -237,40 +443,12 @@ ApplicationWindow {
         audioOutput: AudioOutput {}
         videoOutput: videoOut
         source: win.viewer && win.viewer.fileUrl ? win.viewer.fileUrl : ""
+        onMediaStatusChanged: if (mediaStatus === MediaPlayer.EndOfMedia) win.closeViewer()
     }
 
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
-
-        Rectangle {
-            Layout.fillWidth: true
-            height: 44
-            color: Theme.railBg
-            RowLayout {
-                anchors.fill: parent
-                anchors.margins: 10
-                spacing: 8
-                Text {
-                    text: "WhatsApp"
-                    textFormat: Text.PlainText
-                    color: Theme.textPrimary
-                    font.family: Theme.fontFamily
-                    font.pixelSize: 14
-                    font.bold: true
-                }
-                Item { Layout.fillWidth: true }
-                Text {
-                    text: WhatsApp.activity
-                    textFormat: Text.PlainText
-                    color: (WhatsApp.sending || WhatsApp.loadingMessages || WhatsApp.refreshing || WhatsApp.syncActive)
-                           ? Theme.accent : Theme.textDim
-                    font.family: Theme.fontFamily
-                    font.pixelSize: 12
-                    elide: Text.ElideLeft
-                }
-            }
-        }
 
         RowLayout {
             Layout.fillWidth: true
@@ -419,13 +597,6 @@ ApplicationWindow {
                                 font.pixelSize: 14
                                 font.bold: true
                             }
-                            Text {
-                                visible: !!(chat && chat.isGroup)
-                                text: "group"
-                                textFormat: Text.PlainText
-                                color: Theme.textDim
-                                font.pixelSize: 11
-                            }
                         }
                     }
                     Item {
@@ -439,6 +610,8 @@ ApplicationWindow {
                             reuseItems: true
                             model: win.threadMessages
                             onMovementEnded: {
+                                restoreTimer.stop()
+                                win.pinning = false
                                 if (win.pinning)
                                     return
                                 win.stickToEnd = atYEnd
@@ -458,13 +631,15 @@ ApplicationWindow {
                                 }
                                 onDownload: function(msg) {
                                     win.stickToEnd = false
-                                    win.anchorId = msg && msg.id ? msg.id : win.anchorId
                                     win.anchorY = thread.contentY
                                     WhatsApp.download(msg)
                                 }
                                 onReply: function(msg) { if (msg && !msg.pending) composer.reply = msg }
                                 onReact: function(msg, emoji) { win.reactNow(msg, emoji) }
                                 onPickReaction: function(msg) { win.pickReact(msg) }
+                                onJumpTo: function(id) { win.focusMessage(id) }
+                                onOpenLink: function(preview, external) { win.openLink(preview, external) }
+                                highlighted: modelData.id === win.highlightId
                             }
                         }
                         Text {
@@ -542,7 +717,12 @@ ApplicationWindow {
                 }
                 AppButton {
                     text: "Open externally"
-                    onClicked: if (win.viewer && win.viewer.localPath) WhatsApp.openFile(win.viewer.localPath)
+                    onClicked: {
+                        if (win.viewer && win.viewer.kind === "embed" && win.viewer.pageUrl)
+                            Qt.openUrlExternally(win.viewer.pageUrl)
+                        else if (win.viewer && win.viewer.localPath)
+                            WhatsApp.openFile(win.viewer.localPath)
+                    }
                 }
                 AppButton {
                     text: "Close"
@@ -570,14 +750,101 @@ ApplicationWindow {
                     anchors.fill: parent
                     visible: win.viewer && (win.viewer.kind === "video" || win.viewer.kind === "voice" || win.viewer.kind === "audio")
                 }
+                Text {
+                    anchors.centerIn: parent
+                    visible: !!(win.viewer && win.viewer.kind === "embed" && !win.viewer.embedUrl)
+                    text: (win.viewer && win.viewer.failed) ? "Couldn't play inline. Open externally." : "Loading…"
+                    textFormat: Text.PlainText
+                    color: "#ffffff"
+                    font.pixelSize: 14
+                }
+                Loader {
+                    id: embedView
+                    anchors.fill: parent
+                    active: !!(win.viewer && win.viewer.kind === "embed" && win.viewer.embedUrl)
+                    sourceComponent: Component {
+                        WebEngineView {
+                            id: embed
+                            backgroundColor: "#000000"
+                            audioMuted: false
+                            settings.javascriptEnabled: true
+                            settings.localStorageEnabled: true
+                            settings.playbackRequiresUserGesture: false
+                            profile: embedProfile
+                            Component.onCompleted: boot()
+                            function boot() {
+                                var u = win.embedWatchUrl(win.viewer && win.viewer.embedUrl)
+                                if (!u)
+                                    return
+                                if (u.indexOf("instagram.com") !== -1) {
+                                    var src = u.replace(/&/g, "&amp;").replace(/"/g, "&quot;")
+                                    loadHtml(
+                                        "<!DOCTYPE html><html><head><meta charset='utf-8'><style>"
+                                        + "html,body,iframe{margin:0;padding:0;width:100%;height:100%;border:0;background:#000;overflow:hidden}"
+                                        + "</style></head><body><iframe src='" + src
+                                        + "' allow='autoplay; fullscreen; encrypted-media; picture-in-picture' allowfullscreen></iframe></body></html>",
+                                        "https://www.instagram.com/"
+                                    )
+                                    return
+                                }
+                                url = u
+                            }
+                            function kickPlay() {
+                                runJavaScript(win.embedKickScript(), function(ok) {
+                                    if (ok)
+                                        playTimer.stop()
+                                })
+                            }
+                            Timer {
+                                id: playTimer
+                                interval: 250
+                                repeat: true
+                                triggeredOnStart: true
+                                property int tries: 0
+                                onTriggered: {
+                                    tries += 1
+                                    if (tries > 8) {
+                                        stop()
+                                        return
+                                    }
+                                    embed.kickPlay()
+                                }
+                            }
+                            onLoadingChanged: function(info) {
+                                if (info.status === WebEngineView.LoadSucceededStatus) {
+                                    playTimer.tries = 0
+                                    playTimer.restart()
+                                }
+                            }
+                            onNavigationRequested: function(request) {
+                                if (!request.isMainFrame
+                                    || request.navigationType !== WebEngineView.LinkClickedNavigation
+                                    || win.isEmbedPlayer(request.url.toString())) {
+                                    request.action = WebEngineView.AcceptRequest
+                                    return
+                                }
+                                request.action = WebEngineView.IgnoreRequest
+                            }
+                            onNewWindowRequested: function(request) {
+                            }
+                        }
+                    }
+                }
                 MouseArea {
                     anchors.fill: parent
+                    visible: !embedView.active
                     cursorShape: Qt.PointingHandCursor
                     onClicked: win.closeViewer()
                 }
             }
         }
         Keys.onEscapePressed: win.closeViewer()
+    }
+
+    Shortcut {
+        enabled: win.viewer !== null
+        sequences: ["Escape"]
+        onActivated: win.closeViewer()
     }
 
     TextInput {

@@ -11,6 +11,8 @@
 #include "OmarchyTheme.hpp"
 #include "WhatsApp.hpp"
 
+#include <QtWebEngineQuick/qtwebenginequickglobal.h>
+
 static const char kSocketName[] = "whatsapp-gui";
 
 class Shell : public QObject {
@@ -36,6 +38,14 @@ static bool sendToRunning(const QString &line) {
 }
 
 int main(int argc, char *argv[]) {
+    QByteArray chromium = qgetenv("QTWEBENGINE_CHROMIUM_FLAGS");
+    if (!chromium.contains("autoplay-policy")) {
+        if (!chromium.isEmpty())
+            chromium += ' ';
+        chromium += QByteArrayLiteral("--autoplay-policy=no-user-gesture-required");
+        qputenv("QTWEBENGINE_CHROMIUM_FLAGS", chromium);
+    }
+
     QGuiApplication app(argc, argv);
     app.setApplicationName(QStringLiteral("WhatsApp"));
     app.setApplicationDisplayName(QStringLiteral("WhatsApp"));
@@ -67,6 +77,8 @@ int main(int argc, char *argv[]) {
         line = QStringLiteral("open ") + chatArg;
     if (sendToRunning(line))
         return 0;
+
+    QtWebEngineQuick::initialize();
 
     QLocalServer::removeServer(QLatin1String(kSocketName));
     QLocalServer server;

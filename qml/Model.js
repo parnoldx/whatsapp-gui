@@ -218,13 +218,93 @@ function overlayMyReactions(messages, pending) {
   return { messages: list, pending: keep }
 }
 
+function canonicalHost(host) {
+  var h = String(host || "").toLowerCase()
+  if (h.indexOf("www.") === 0) h = h.slice(4)
+  if (h === "m.instagram.com") return "instagram.com"
+  if (h === "m.facebook.com" || h === "web.facebook.com") return "facebook.com"
+  if (h === "m.tiktok.com") return "tiktok.com"
+  if (h === "vt.tiktok.com") return "vm.tiktok.com"
+  if (h === "mobile.twitter.com") return "twitter.com"
+  return h
+}
+
+function embedUrlFor(host, url) {
+  var raw = String(url || "")
+  var h = canonicalHost(host)
+  if (!h && raw) {
+    h = canonicalHost(raw.replace(/^https?:\/\//i, "").split("/")[0])
+  }
+  var path = raw.replace(/^https?:\/\/[^/?#]+/i, "")
+  var m
+  if (h === "instagram.com") {
+    m = path.match(/\/(reel|p|tv)\/([^/?#]+)/)
+    return m ? ("https://www.instagram.com/" + m[1] + "/" + m[2] + "/embed/") : ""
+  }
+  if (h === "tiktok.com") {
+    m = path.match(/\/(?:video|photo|v)\/(\d+)/) || path.match(/\/embed\/(?:v2|v3)\/(\d+)/)
+    return m ? ("https://www.tiktok.com/embed/v2/" + m[1]) : ""
+  }
+  if (h === "youtube.com" || h === "youtu.be" || h === "m.youtube.com") {
+    var id = ""
+    if (h === "youtu.be") id = path.replace(/^\//, "").split(/[/?#]/)[0]
+    if (!id) {
+      m = path.match(/\/(?:embed|shorts|live)\/([^/?#]+)/)
+      if (m) id = m[1]
+    }
+    if (!id) {
+      m = raw.match(/[?&]v=([^&?#]+)/)
+      if (m) id = m[1]
+    }
+    return id ? ("https://www.youtube.com/embed/" + id) : ""
+  }
+  if (h === "x.com" || h === "twitter.com") {
+    m = path.match(/\/(?:i\/web\/)?status\/(\d+)/)
+    return m ? ("https://platform.twitter.com/embed/Tweet.html?id=" + m[1] + "&dnt=true&theme=dark") : ""
+  }
+  if (h === "facebook.com" || h === "fb.watch") {
+    if (h === "facebook.com" && /\/share\/[rv]\//.test(path))
+      return ""
+    var canonical = raw.replace(/[?#].*$/, "")
+    if (h === "facebook.com") {
+      var fbPath = canonical.replace(/^https?:\/\/[^/]+/i, "")
+      if (fbPath.indexOf("/") !== 0) fbPath = "/" + fbPath
+      canonical = "https://www.facebook.com" + fbPath
+    }
+    return canonical ? ("https://www.facebook.com/plugins/video.php?href=" + encodeURIComponent(canonical) + "&show_text=false") : ""
+  }
+  return ""
+}
+
+function linkEmbed(preview) {
+  if (!preview) return ""
+  var u = preview.embedUrl ? String(preview.embedUrl) : embedUrlFor(preview.host || "", preview.url || "")
+  if (u.indexOf("plugins/video.php") !== -1 && u.indexOf("%2Fshare%2F") !== -1)
+    return ""
+  return u.replace("/embed/v3/", "/embed/v2/")
+}
+
+function needsEmbedResolve(preview) {
+  if (!preview || !preview.url) return false
+  if (linkEmbed(preview)) return false
+  var h = canonicalHost(preview.host || "")
+  if (!h) h = canonicalHost(String(preview.url).replace(/^https?:\/\//i, "").split("/")[0])
+  if (h === "vm.tiktok.com" || h === "t.co") return true
+  if (h === "tiktok.com") {
+    var path = String(preview.url)
+    return path.indexOf("/video/") === -1 && path.indexOf("/photo/") === -1 && path.indexOf("/embed/") === -1
+  }
+  if (h === "facebook.com")
+    return /\/share\/[rv]\//.test(String(preview.url))
+  return false
+}
+
 function parseLink(text) {
   var raw = String(text || "")
   var match = raw.match(/https?:\/\/[^\s<>"']+/i)
   if (!match) return null
   var url = match[0].replace(/[).,;:!?]+$/, "")
-  var host = url.replace(/^https?:\/\//i, "").split("/")[0].toLowerCase()
-  if (host.indexOf("www.") === 0) host = host.slice(4)
+  var host = canonicalHost(url.replace(/^https?:\/\//i, "").split("/")[0])
   var path = url.replace(/^https?:\/\/[^/]+/i, "")
   var site = host
   var label = host
@@ -247,7 +327,16 @@ function parseLink(text) {
     site = "Facebook"
     label = "Facebook"
   }
-  return { url: url, host: host, site: site, label: label, title: label, description: "", imageUrl: "" }
+  return {
+    url: url,
+    host: host,
+    site: site,
+    label: label,
+    title: label,
+    description: "",
+    imageUrl: "",
+    embedUrl: embedUrlFor(host, url)
+  }
 }
 
 function textIsOnlyUrl(text, url) {
@@ -422,6 +511,10 @@ if (typeof module !== "undefined" && module.exports) {
     applyMyReaction: applyMyReaction,
     overlayMyReactions: overlayMyReactions,
     parseLink: parseLink,
+    canonicalHost: canonicalHost,
+    embedUrlFor: embedUrlFor,
+    linkEmbed: linkEmbed,
+    needsEmbedResolve: needsEmbedResolve,
     textIsOnlyUrl: textIsOnlyUrl,
     mentionToken: mentionToken,
     applyMention: applyMention,

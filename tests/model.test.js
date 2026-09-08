@@ -121,8 +121,57 @@ test("parseLink recognizes Instagram reels", () => {
   assert.equal(preview.site, "Instagram")
   assert.equal(preview.label, "Reel")
   assert.equal(preview.host, "instagram.com")
+  assert.equal(preview.embedUrl, "https://www.instagram.com/reel/Dc66-wqjore/embed/")
   assert.equal(Model.textIsOnlyUrl("https://www.instagram.com/reel/Dc66-wqjore/?stkn=abc", preview.url), true)
   assert.equal(Model.textIsOnlyUrl("look https://example.com", "https://example.com"), false)
+})
+
+test("parseLink builds official embed URLs", () => {
+  assert.equal(
+    Model.parseLink("https://www.instagram.com/p/Dc9x-rfASm0/?img_index=1").embedUrl,
+    "https://www.instagram.com/p/Dc9x-rfASm0/embed/"
+  )
+  assert.equal(
+    Model.parseLink("https://www.tiktok.com/@_omarreacts/video/7662159610396052757?_r=1").embedUrl,
+    "https://www.tiktok.com/embed/v2/7662159610396052757"
+  )
+  assert.equal(Model.parseLink("https://vm.tiktok.com/ZGdxcYD6r/").embedUrl, "")
+  assert.equal(
+    Model.parseLink("https://www.tiktok.com/@x/photo/7662159610396052757").embedUrl,
+    "https://www.tiktok.com/embed/v2/7662159610396052757"
+  )
+  assert.equal(Model.needsEmbedResolve(Model.parseLink("https://vm.tiktok.com/ZGdxcYD6r/")), true)
+  assert.equal(Model.needsEmbedResolve(Model.parseLink("https://www.tiktok.com/t/ZPabcdef/")), true)
+  assert.equal(
+    Model.needsEmbedResolve(Model.parseLink("https://www.tiktok.com/@x/video/7662159610396052757")),
+    false
+  )
+  assert.equal(Model.parseLink("https://www.facebook.com/share/r/18KkbJYRmm/").embedUrl, "")
+  assert.equal(
+    Model.needsEmbedResolve(Model.parseLink("https://www.facebook.com/share/r/18KkbJYRmm/")),
+    true
+  )
+  assert.equal(
+    Model.parseLink("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=4").embedUrl,
+    "https://www.youtube.com/embed/dQw4w9WgXcQ"
+  )
+  assert.equal(
+    Model.parseLink("https://youtu.be/dQw4w9WgXcQ").embedUrl,
+    "https://www.youtube.com/embed/dQw4w9WgXcQ"
+  )
+  assert.equal(
+    Model.parseLink("https://www.facebook.com/reel/2257374628373907/?fs=e").embedUrl,
+    "https://www.facebook.com/plugins/video.php?href=https%3A%2F%2Fwww.facebook.com%2Freel%2F2257374628373907%2F&show_text=false"
+  )
+  assert.equal(
+    Model.parseLink("https://x.com/BarackObama/status/266031293945503744?s=20").embedUrl,
+    "https://platform.twitter.com/embed/Tweet.html?id=266031293945503744&dnt=true&theme=dark"
+  )
+  assert.equal(Model.parseLink("https://example.com/x").embedUrl, "")
+  const cached = { url: "https://vm.tiktok.com/ZGdxcYD6r/", host: "vm.tiktok.com" }
+  assert.equal(Model.linkEmbed(cached), "")
+  cached.embedUrl = "https://www.tiktok.com/embed/v3/7662159610396052757"
+  assert.equal(Model.linkEmbed(cached), "https://www.tiktok.com/embed/v2/7662159610396052757")
 })
 
 test("fileKind guesses from the path", () => {
