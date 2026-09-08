@@ -1,0 +1,2041 @@
+#!/usr/bin/env python3
+"""Local helper for pa.whatsapp.
+
+Reads wacli's SQLite mirror read-only. Every WhatsApp write goes through the
+wacli CLI. Never logs chat names, JIDs, message bodies, or media paths.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import html
+import json
+import os
+import re
+import secrets
+import shutil
+import sqlite3
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+from urllib.parse import quote, urljoin, urlparse
+from urllib.request import Request, urlopen
+
+MAX_TEXT = 4096
+MAX_FILE = 100 * 1024 * 1024
+MAX_CHATS = 200
+MAX_MESSAGES = 200
+MAX_PARTICIPANTS = 500
+MAX_STDOUT = 2 * 1024 * 1024
+MAX_FILES = 10
+WACLI = os.environ.get("WACLI_BIN", "wacli")
+JID_RE = re.compile(r"^[A-Za-z0-9._:-]+@[A-Za-z0-9._-]+$")
+URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
+MEDIA_KINDS = {"image", "video", "gif", "sticker", "voice", "audio", "document"}
+PLACEHOLDERS = {
+    "sent image": "Photo",
+    "image": "Photo",
+    "sent video": "Video",
+    "video": "Video",
+    "sent gif": "GIF",
+    "gif": "GIF",
+    "sent sticker": "Sticker",
+    "sticker": "Sticker",
+    "sent audio": "Audio",
+    "audio": "Audio",
+    "sent voice": "Voice note",
+    "voice": "Voice note",
+    "ptt": "Voice note",
+    "sent document": "Document",
+    "document": "Document",
+    "sent location": "Location",
+    "location": "Location",
+    "sent contact": "Contact",
+    "contact": "Contact",
+}
+
+
+class HelperError(Exception):
+    def __init__(self, message: str, code: int = 1) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def state_dir() -> Path:
+    raw = os.environ.get("PA_WHATSAPP_STATE")
+    if raw:
+        path = Path(raw)
+    else:
+        xdg = os.environ.get("XDG_STATE_HOME")
+        path = Path(xdg) / "pa-whatsapp" if xdg else Path.home() / ".local/state/pa-whatsapp"
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
+def store_dir(explicit: str | None = None) -> Path:
+    if explicit:
+        return Path(explicit).expanduser()
+    env = os.environ.get("WACLI_STORE_DIR")
+    if env:
+        return Path(env).expanduser()
+    xdg = os.environ.get("XDG_STATE_HOME")
+    if xdg:
+        return Path(xdg) / "wacli"
+    return Path.home() / ".local/state/wacli"
+
+
+def db_path(store: Path) -> Path:
+    return store / "wacli.db"
+
+
+_LID_MAP: dict[str, str] | None = None
+
+
+def lid_pn_map(store: Path) -> dict[str, str]:
+    """lid_jid <-> pn_jid, both directions, from whatsmeow's session store.
+
+    WhatsApp splits one conversation across a phone-number JID and a LID JID;
+    this map lets us stitch them back into a single thread.
+    ponytail: cached for process lifetime; the GUI restarts the daemon, and a
+    mapping added mid-session just shows up on next launch.
+    """
+    global _LID_MAP
+    if _LID_MAP is not None:
+        return _LID_MAP
+    out: dict[str, str] = {}
+    path = store / "session.db"
+    if path.is_file():
+        try:
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                for lid, pn in con.execute("SELECT lid, pn FROM whatsmeow_lid_map"):
+                    lj, pj = f"{lid}@lid", f"{pn}@s.whatsapp.net"
+                    out[lj] = pj
+                    out[pj] = lj
+            finally:
+                con.close()
+        except sqlite3.Error:
+            pass
+    _LID_MAP = out
+    return out
+
+
+def sibling_jids(store: Path, jid: str) -> list[str]:
+    other = lid_pn_map(store).get(jid)
+    return [jid, other] if other else [jid]
+
+
+def prefs_path() -> Path:
+    return state_dir() / "prefs.json"
+
+
+def media_index_path() -> Path:
+    return state_dir() / "media-index.json"
+
+
+def media_key(jid: str, msg_id: str) -> str:
+    return hashlib.sha256(f"{jid}\n{msg_id}".encode()).hexdigest()
+
+
+MIME_EXT = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "video/mp4": ".mp4",
+    "audio/ogg": ".ogg",
+    "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+    "application/pdf": ".pdf",
+}
+
+
+def media_ext(mime: str, filename: str, kind: str) -> str:
+    name = Path(filename or "").suffix
+    if name and len(name) <= 8:
+        return name
+    mime = (mime or "").split(";", 1)[0].strip().lower()
+    if mime in MIME_EXT:
+        return MIME_EXT[mime]
+    return {
+        "image": ".jpg",
+        "sticker": ".webp",
+        "gif": ".mp4",
+        "video": ".mp4",
+        "voice": ".ogg",
+        "audio": ".ogg",
+        "document": "",
+    }.get(kind, "")
+
+
+def emit(payload: dict) -> None:
+    json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+    sys.stdout.write("\n")
+
+
+def humanize_wacli_error(err: object) -> str:
+    if isinstance(err, dict):
+        err = err.get("message") or err.get("error") or err
+    text = str(err or "").replace("\n", " ").strip()
+    low = text.lower()
+    if "locked" in low or "lock-wait" in low or "another wacli" in low:
+        return "WhatsApp is busy syncing. Try again in a moment."
+    if "timed out" in low or "timeout" in low:
+        return "WhatsApp took too long to respond."
+    if not text:
+        return "wacli command failed"
+    return text[:180]
+
+
+def fail(message: str, code: int = 1) -> None:
+    raise HelperError(humanize_wacli_error(message), code)
+
+
+def require_jid(value: str | None) -> str:
+    jid = str(value or "").strip()
+    if not jid or not JID_RE.match(jid):
+        fail("chat target is not a valid JID")
+    return jid
+
+
+def file_url(path: str | None) -> str:
+    if not path:
+        return ""
+    return Path(path).resolve().as_uri()
+
+
+def video_thumb(local: str) -> str:
+    """JPEG of the first frame, written next to a downloaded video. Empty on miss."""
+    src = Path(str(local or ""))
+    if not src.is_file():
+        return ""
+    dest = src.with_suffix(".jpg")
+    try:
+        if dest.is_file() and dest.stat().st_size > 32 and dest.stat().st_mtime >= src.stat().st_mtime:
+            return str(dest)
+    except OSError:
+        pass
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-ss",
+                "0",
+                "-i",
+                str(src),
+                "-frames:v",
+                "1",
+                "-q:v",
+                "4",
+                str(dest),
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        if dest.is_file() and dest.stat().st_size > 32:
+            os.chmod(dest, 0o600)
+            return str(dest)
+        dest.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return ""
+
+
+def looks_like_id(text: str, jid: str = "") -> bool:
+    name = str(text or "").strip()
+    if not name or name.lower() in {"unknown", "unknown group"}:
+        return True
+    if jid and name == jid:
+        return True
+    return bool(JID_RE.match(name))
+
+
+def fallback_from_jid(jid: str) -> str:
+    value = str(jid or "").strip()
+    if not value:
+        return "Unknown"
+    local, _, host = value.partition("@")
+    if host in {"g.us", "lid"}:
+        return "Unknown group"
+    if local.isdigit() and len(local) >= 8:
+        return "+" + local
+    return "Unknown"
+
+
+def pick_name(*parts: object, jid: str = "") -> str:
+    for part in parts:
+        text = str(part or "").strip()
+        if text and not looks_like_id(text, jid):
+            return text
+    return fallback_from_jid(jid)
+
+
+def placeholder_label(value: str) -> str:
+    key = re.sub(r"\s+", " ", str(value or "").strip()).lower()
+    if key in {"(message)", "message"}:
+        return " "
+    return PLACEHOLDERS.get(key, "")
+
+
+def human_preview(raw: str) -> str:
+    text = str(raw or "").replace("\n", " ").strip()
+    if not text:
+        return ""
+    lines = [ln.strip() for ln in str(raw or "").splitlines() if ln.strip()]
+    last = lines[-1] if lines else text
+    mapped = placeholder_label(last).strip()
+    if mapped:
+        return mapped[:180]
+    if placeholder_label(last):
+        return ""
+    url = first_url(text)
+    if url:
+        preview = describe_link(url)
+        if preview and preview.get("site") and preview["site"] != preview.get("host"):
+            if preview.get("label") and preview["label"] != preview["site"]:
+                return f"{preview['site']} {preview['label']}"
+            return preview["site"]
+    return text[:180]
+
+
+def visible_body(display: str, text: str, caption: str, kind: str) -> tuple[str, str]:
+    caption_text = str(caption or "").strip()
+    raw_text = str(text or "").strip()
+    display_text = str(display or "").strip()
+    if placeholder_label(caption_text):
+        caption_text = ""
+    if kind in MEDIA_KINDS:
+        body = caption_text or raw_text
+        if placeholder_label(body):
+            body = ""
+        return body, body
+    body = raw_text or display_text
+    lines = [ln.strip() for ln in body.splitlines()]
+    while lines and placeholder_label(lines[-1]):
+        lines.pop()
+    body = "\n".join(lines).strip()
+    if placeholder_label(body):
+        body = caption_text
+    return body, caption_text
+
+
+def first_url(text: str) -> str:
+    match = URL_RE.search(str(text or ""))
+    if not match:
+        return ""
+    return match.group(0).rstrip(").,;:!?]}")
+
+
+def describe_link(url: str) -> dict:
+    raw = str(url or "").strip()
+    if not raw:
+        return {}
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = parsed.path or ""
+    site = host
+    label = host
+    if host == "instagram.com":
+        site = "Instagram"
+        if "/reel/" in path:
+            label = "Reel"
+        elif "/p/" in path:
+            label = "Post"
+        elif "/tv/" in path:
+            label = "Video"
+        else:
+            label = "Instagram"
+    elif host in {"tiktok.com", "vm.tiktok.com"}:
+        site, label = "TikTok", "TikTok"
+    elif host in {"youtube.com", "youtu.be", "m.youtube.com"}:
+        site, label = "YouTube", "YouTube"
+    elif host in {"x.com", "twitter.com", "t.co"}:
+        site, label = "X", "Post"
+    elif host == "open.spotify.com":
+        site, label = "Spotify", "Spotify"
+    elif host in {"facebook.com", "fb.watch"}:
+        site, label = "Facebook", "Facebook"
+    return {
+        "url": raw,
+        "host": host,
+        "site": site,
+        "label": label,
+        "title": label,
+        "description": "",
+        "imageUrl": "",
+        "fetched": False,
+    }
+
+
+def link_cache_path() -> Path:
+    return state_dir() / "link-previews.json"
+
+
+def load_link_cache() -> dict:
+    path = link_cache_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_link_cache(cache: dict) -> None:
+    path = link_cache_path()
+    tmp = path.with_name(f".link-previews.{secrets.token_hex(8)}.tmp")
+    payload = json.dumps(cache, ensure_ascii=False, indent=2) + "\n"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+CRAWLER_UA = (
+    "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php) "
+    "WhatsApp/2.24.12.80"
+)
+BROWSER_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+OEMBED = {
+    "tiktok.com": "https://www.tiktok.com/oembed?url={url}",
+    "vm.tiktok.com": "https://www.tiktok.com/oembed?url={url}",
+    "youtube.com": "https://www.youtube.com/oembed?format=json&url={url}",
+    "m.youtube.com": "https://www.youtube.com/oembed?format=json&url={url}",
+    "youtu.be": "https://www.youtube.com/oembed?format=json&url={url}",
+    "open.spotify.com": "https://open.spotify.com/oembed?url={url}",
+    "x.com": "https://publish.twitter.com/oembed?url={url}",
+    "twitter.com": "https://publish.twitter.com/oembed?url={url}",
+}
+
+
+def _meta_og(page: str) -> dict:
+    out: dict[str, str] = {}
+    for tag in re.findall(r"<meta\b[^>]*>", page, re.I):
+        prop = re.search(
+            r"""(?:property|name)\s*=\s*['"](?:og|twitter):(title|description|image(?::secure_url)?)['"]""",
+            tag,
+            re.I,
+        )
+        content = re.search(r"""content\s*=\s*['"]([^'"]+)['"]""", tag, re.I)
+        if not prop or not content:
+            continue
+        key = prop.group(1).lower()
+        if key == "image:secure_url":
+            key = "image"
+        if key not in out:
+            out[key] = html.unescape(content.group(1)).strip()
+    return out
+
+
+def _http_url(url: str) -> str:
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    host = (parsed.hostname or "").lower()
+    if not host or host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".local"):
+        return ""
+    return parsed.geturl()
+
+
+def _http_get(url: str, ua: str, timeout: int = 8, limit: int = 512 * 1024) -> tuple[bytes, str, str]:
+    target = _http_url(url)
+    if not target:
+        return b"", "", ""
+    req = Request(
+        target,
+        headers={
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/json,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        method="GET",
+    )
+    with urlopen(req, timeout=timeout) as resp:
+        if getattr(resp, "status", 200) >= 400:
+            return b"", "", resp.geturl() or target
+        data = resp.read(limit)
+        ctype = (resp.headers.get_content_type() or "").lower()
+        return data, ctype, resp.geturl() or target
+
+
+def fetch_og(url: str) -> dict:
+    target = _http_url(url)
+    if not target:
+        return {}
+    page = ""
+    final = target
+    for ua in (CRAWLER_UA, BROWSER_UA):
+        try:
+            raw, ctype, final = _http_get(target, ua)
+        except Exception:
+            continue
+        if not raw or (ctype and "html" not in ctype and "xml" not in ctype and "json" not in ctype):
+            continue
+        page = raw.decode("utf-8", errors="replace")
+        if "og:image" in page or "og:title" in page or "twitter:image" in page:
+            break
+    if not page:
+        return {}
+    og = _meta_og(page)
+    image = og.get("image") or ""
+    if image.startswith("//"):
+        image = "https:" + image
+    elif image and not image.startswith("http"):
+        image = urljoin(final, image)
+    image = _http_url(image)
+    title = (og.get("title") or "").strip()
+    description = (og.get("description") or "").strip()
+    out = {}
+    if title:
+        out["title"] = title[:180]
+    if description:
+        out["description"] = description[:240]
+    if image:
+        out["imageUrl"] = image
+    return out
+
+
+def fetch_oembed(url: str, host: str) -> dict:
+    template = OEMBED.get(host)
+    if not template:
+        return {}
+    endpoint = template.format(url=quote(url, safe=""))
+    try:
+        raw, ctype, _final = _http_get(endpoint, BROWSER_UA, timeout=6, limit=64 * 1024)
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    title = str(data.get("title") or "").strip()
+    author = str(data.get("author_name") or "").strip()
+    thumb = str(data.get("thumbnail_url") or "").strip()
+    if title:
+        out["title"] = title[:180]
+    if author:
+        out["description"] = author[:240]
+    if thumb:
+        out["imageUrl"] = thumb
+    return out
+
+
+def link_thumb_dir() -> Path:
+    path = state_dir() / "link-thumbs"
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
+def cache_remote_image(url: str, key: str) -> str:
+    target = _http_url(url)
+    if not target:
+        return ""
+    dest = link_thumb_dir() / (hashlib.sha256(key.encode()).hexdigest() + ".jpg")
+    if dest.is_file() and dest.stat().st_size > 0:
+        return file_url(str(dest))
+    try:
+        raw, ctype, _final = _http_get(target, BROWSER_UA, timeout=8, limit=2 * 1024 * 1024)
+    except Exception:
+        return ""
+    if not raw or len(raw) < 32:
+        return ""
+    if ctype and not ctype.startswith("image/") and raw[:3] not in {b"\xff\xd8\xff", b"\x89PN", b"GIF"}:
+        return ""
+    dest.write_bytes(raw)
+    os.chmod(dest, 0o600)
+    return file_url(str(dest))
+
+
+def fetch_social_preview(url: str, host: str) -> dict:
+    out = fetch_oembed(url, host)
+    og = fetch_og(url)
+    if og.get("title") and (not out.get("title") or out["title"] in {"Reel", "Post", "TikTok", "YouTube", "X", "Spotify"}):
+        out["title"] = og["title"]
+    elif og.get("title") and "title" not in out:
+        out["title"] = og["title"]
+    if og.get("description") and not out.get("description"):
+        out["description"] = og["description"]
+    if og.get("imageUrl") and not out.get("imageUrl"):
+        out["imageUrl"] = og["imageUrl"]
+    image = out.get("imageUrl") or ""
+    if image:
+        local = cache_remote_image(image, url)
+        if local:
+            out["imageUrl"] = local
+    return out
+
+
+def cmd_link_preview(url: str) -> dict:
+    preview = describe_link(first_url(url) or url)
+    if not preview:
+        fail("url is missing")
+    target = preview["url"]
+    cache = load_link_cache()
+    cached = cache.get(target)
+    if isinstance(cached, dict) and (cached.get("title") or cached.get("imageUrl")):
+        preview.update({k: cached[k] for k in ("title", "description", "imageUrl") if cached.get(k)})
+        preview["fetched"] = True
+        return preview
+    fetched = fetch_social_preview(target, preview.get("host") or "")
+    if fetched:
+        keep = {k: fetched[k] for k in ("title", "description", "imageUrl") if fetched.get(k)}
+        cache[target] = keep
+        if len(cache) > 400:
+            keys = list(cache.keys())
+            for key in keys[: len(keys) - 400]:
+                cache.pop(key, None)
+        save_link_cache(cache)
+        preview.update(keep)
+    preview["fetched"] = True
+    return preview
+
+
+def attach_link_preview(text: str, cache: dict | None = None) -> dict:
+    url = first_url(text)
+    if not url:
+        return {}
+    preview = describe_link(url)
+    cached = (cache or {}).get(url)
+    if isinstance(cached, dict):
+        for key in ("title", "description", "imageUrl"):
+            if cached.get(key):
+                preview[key] = cached[key]
+        if cached.get("title") or cached.get("imageUrl"):
+            preview["fetched"] = True
+    return preview
+
+
+def avatar_dir() -> Path:
+    path = state_dir() / "avatars"
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
+def avatar_index_path() -> Path:
+    return state_dir() / "avatar-index.json"
+
+
+def avatar_file(jid: str) -> Path:
+    return avatar_dir() / (hashlib.sha256(jid.encode()).hexdigest() + ".jpg")
+
+
+def load_avatar_index() -> dict:
+    path = avatar_index_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_avatar_index(index: dict) -> None:
+    path = avatar_index_path()
+    tmp = path.with_name(f".avatar-index.{secrets.token_hex(8)}.tmp")
+    payload = json.dumps(index, ensure_ascii=False, indent=2) + "\n"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def cached_avatar_url(jid: str) -> str:
+    path = avatar_file(jid)
+    if path.is_file() and path.stat().st_size > 0:
+        return file_url(str(path))
+    return ""
+
+
+def _picture_field(data: dict, *keys: str) -> str:
+    for key in keys:
+        value = data.get(key)
+        if value:
+            return str(value)
+        for actual, item in data.items():
+            if str(actual).lower() == key.lower() and item:
+                return str(item)
+    return ""
+
+
+def cmd_avatar(store: Path, jid: str) -> dict:
+    jid = require_jid(jid)
+    local = avatar_file(jid)
+    cached = cached_avatar_url(jid)
+    index = load_avatar_index()
+    entry = index.get(jid) if isinstance(index.get(jid), dict) else {}
+    if cached:
+        return {"jid": jid, "localPath": str(local), "fileUrl": cached, "id": str(entry.get("id") or "")}
+    failed_at = int(entry.get("failedAt") or 0)
+    if failed_at and int(time.time()) - failed_at < 600:
+        return {"jid": jid, "localPath": "", "fileUrl": "", "id": ""}
+    args = ["profile", "picture-info", "--jid", jid, "--preview"]
+    known_id = str(entry.get("id") or "")
+    if known_id:
+        args.extend(["--existing-id", known_id])
+    try:
+        data = run_wacli(args, store=store, timeout=20, lock_wait="0s")
+    except HelperError:
+        index[jid] = {"id": known_id, "failedAt": int(time.time())}
+        save_avatar_index(index)
+        return {"jid": jid, "localPath": "", "fileUrl": "", "id": known_id}
+    url = _picture_field(data, "url", "URL")
+    pic_id = _picture_field(data, "id", "ID")
+    if not url:
+        index[jid] = {"id": pic_id or known_id, "failedAt": int(time.time())}
+        save_avatar_index(index)
+        return {"jid": jid, "localPath": "", "fileUrl": cached, "id": pic_id}
+    try:
+        raw, _ctype, _final = _http_get(url, BROWSER_UA, timeout=10, limit=1024 * 1024)
+    except Exception:
+        raw = b""
+    if not raw:
+        index[jid] = {"id": pic_id or known_id, "failedAt": int(time.time())}
+        save_avatar_index(index)
+        return {"jid": jid, "localPath": "", "fileUrl": "", "id": pic_id}
+    local.write_bytes(raw)
+    os.chmod(local, 0o600)
+    index[jid] = {"id": pic_id, "failedAt": 0}
+    save_avatar_index(index)
+    return {"jid": jid, "localPath": str(local), "fileUrl": file_url(str(local)), "id": pic_id}
+
+
+def unread_since(con: sqlite3.Connection, jid: str, ack: int) -> int:
+    row = con.execute(
+        """
+        SELECT COUNT(*) FROM messages
+        WHERE chat_jid = ?
+          AND ts > ?
+          AND IFNULL(from_me, 0) = 0
+          AND IFNULL(deleted_for_me, 0) = 0
+          AND IFNULL(reaction_to_id, '') = ''
+          AND IFNULL(revoked, 0) = 0
+        """,
+        (jid, int(ack)),
+    ).fetchone()
+    return int(row[0] if row else 0)
+
+
+def load_prefs() -> dict:
+    path = prefs_path()
+    if not path.is_file():
+        return {"receipts": False, "acks": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"receipts": False, "acks": {}}
+    if not isinstance(data, dict):
+        return {"receipts": False, "acks": {}}
+    acks = data.get("acks") if isinstance(data.get("acks"), dict) else {}
+    clean = {}
+    for key, value in acks.items():
+        if JID_RE.match(str(key)):
+            try:
+                clean[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+    return {"receipts": bool(data.get("receipts")), "acks": clean}
+
+
+def save_prefs(prefs: dict) -> None:
+    path = prefs_path()
+    tmp = path.with_name(f".prefs.{secrets.token_hex(8)}.tmp")
+    payload = {"receipts": bool(prefs.get("receipts")), "acks": prefs.get("acks") or {}}
+    data = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def load_media_index() -> dict[str, str]:
+    path = media_index_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    for key, value in data.items():
+        if isinstance(value, str) and Path(value).is_file():
+            out[str(key)] = value
+    return out
+
+
+def save_media_index(index: dict[str, str]) -> None:
+    path = media_index_path()
+    tmp = path.with_name(f".media-index.{secrets.token_hex(8)}.tmp")
+    data = json.dumps(index, ensure_ascii=False, indent=2) + "\n"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def remember_media(jid: str, msg_id: str, local: Path) -> None:
+    index = load_media_index()
+    index[media_key(jid, msg_id)] = str(local)
+    save_media_index(index)
+
+
+def prune_media(days: int = 7, every: int = 6 * 3600) -> None:
+    """Delete downloaded media older than `days`. Marker-gated so it runs
+    at most once per `every` seconds regardless of how often it's called."""
+    marker = state_dir() / ".media-pruned"
+    now = time.time()
+    try:
+        if now - marker.stat().st_mtime < every:
+            return
+    except OSError:
+        pass
+    cutoff = now - days * 86400
+    folder = state_dir() / "media"
+    if folder.is_dir():
+        for entry in folder.iterdir():
+            try:
+                if entry.is_file() and entry.stat().st_mtime < cutoff:
+                    entry.unlink()
+            except OSError:
+                pass
+    marker.touch()
+
+
+def cached_media(jid: str, msg_id: str) -> str:
+    return load_media_index().get(media_key(jid, msg_id), "")
+
+
+def open_db(store: Path) -> sqlite3.Connection:
+    path = db_path(store)
+    if not path.is_file():
+        fail("wacli store is not initialized")
+    uri = path.resolve().as_uri() + "?mode=ro"
+    try:
+        con = sqlite3.connect(uri, uri=True, timeout=2.0)
+    except sqlite3.Error:
+        fail("could not open the local message store")
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA query_only=ON")
+    return con
+
+
+def unwrap_wacli(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        fail("wacli returned an unexpected payload")
+    if payload.get("success") is False or payload.get("ok") is False:
+        fail(payload.get("error") or "wacli command failed")
+    data = payload.get("data")
+    if data is None:
+        return payload
+    if not isinstance(data, dict) and not isinstance(data, list):
+        return {"value": data}
+    return data if isinstance(data, dict) else {"items": data}
+
+
+def run_wacli(
+    args: list[str],
+    store: Path | None = None,
+    timeout: int = 60,
+    readonly: bool = False,
+    lock_wait: str = "15s",
+) -> dict:
+    cmd = [WACLI, "--json"]
+    if readonly:
+        cmd.append("--read-only")
+    if store is not None:
+        cmd.extend(["--store", str(store)])
+    if not readonly and lock_wait:
+        cmd.extend(["--lock-wait", lock_wait])
+    cmd.extend(args)
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError:
+        fail("wacli is not installed")
+    except subprocess.TimeoutExpired:
+        fail("wacli timed out")
+    if len(proc.stdout) > MAX_STDOUT or len(proc.stderr) > MAX_STDOUT:
+        fail("wacli output was too large")
+    raw = proc.stdout.decode("utf-8", errors="replace").strip()
+    if not raw:
+        err = proc.stderr.decode("utf-8", errors="replace").strip()
+        fail(err.splitlines()[0][:180] if err else "wacli produced no output")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        fail("wacli did not return JSON")
+    if proc.returncode != 0:
+        unwrap_wacli(payload if isinstance(payload, dict) else {})
+        fail("wacli command failed")
+    if not isinstance(payload, dict):
+        fail("wacli returned an unexpected payload")
+    return unwrap_wacli(payload)
+
+
+def is_muted(muted_until: int, now: int) -> bool:
+    if muted_until == -1:
+        return True
+    return muted_until > now
+
+
+def media_kind(media_type: str | None, mime: str | None) -> str:
+    kind = (media_type or "").strip().lower()
+    mime = (mime or "").strip().lower()
+    if kind in {"image", "video", "gif", "sticker", "document", "location"}:
+        return kind
+    if kind == "audio":
+        if "opus" in mime or "ogg" in mime:
+            return "voice"
+        return "audio"
+    if mime.startswith("image/"):
+        return "sticker" if "webp" in mime else "image"
+    if mime.startswith("video/"):
+        return "gif" if "gif" in mime else "video"
+    if mime.startswith("audio/"):
+        return "voice" if "opus" in mime or "ogg" in mime else "audio"
+    return "text" if not kind else "unknown"
+
+
+def preview_text(row: sqlite3.Row) -> str:
+    kind = media_kind(
+        row["media_type"] if "media_type" in row.keys() else "",
+        row["mime_type"] if "mime_type" in row.keys() else "",
+    )
+    body, _caption = visible_body(
+        str(row["display_text"] if "display_text" in row.keys() else "") or "",
+        str(row["text"] if "text" in row.keys() else "") or "",
+        str(row["media_caption"] if "media_caption" in row.keys() else "") or "",
+        kind,
+    )
+    if body:
+        return body.replace("\n", " ").strip()[:180]
+    return placeholder_label(kind) or human_preview(
+        str(row["display_text"] if "display_text" in row.keys() else "") or ""
+    )
+
+
+def require_chat(con: sqlite3.Connection, jid: str) -> sqlite3.Row:
+    row = con.execute(
+        """
+        SELECT c.jid, c.kind, c.name, c.last_message_ts, c.archived, c.pinned,
+               c.muted_until, c.unread_count, g.is_parent, g.linked_parent_jid
+        FROM chats c
+        LEFT JOIN groups g ON g.jid = c.jid
+        WHERE c.jid = ?
+        """,
+        (jid,),
+    ).fetchone()
+    if row is None:
+        fail("that chat is not in the local store")
+    if row["kind"] not in {"dm", "group"} and not (
+        row["kind"] == "unknown" and jid.endswith("@lid")
+    ):
+        fail("only direct chats and groups are supported")
+    if row["is_parent"]:
+        fail("community parents are not supported")
+    linked = row["linked_parent_jid"] or ""
+    if linked:
+        fail("community-linked groups are not supported")
+    return row
+
+
+def list_chats(store: Path, query: str = "", limit: int = 80, include_archived: bool = False) -> list[dict]:
+    limit = max(1, min(int(limit), MAX_CHATS))
+    now = int(time.time())
+    needle = query.strip().lower()
+    acks = (load_prefs().get("acks") or {})
+    con = open_db(store)
+    try:
+        rows = con.execute(
+            """
+            SELECT c.jid, c.kind, c.name AS chat_name, c.last_message_ts, c.archived, c.pinned,
+                   c.muted_until, c.unread, c.unread_count, g.is_parent, g.linked_parent_jid,
+                   g.name AS group_name,
+                   ct.full_name AS contact_full, ct.push_name AS contact_push,
+                   ct.business_name AS contact_business, ct.first_name AS contact_first,
+                   (
+                     SELECT COALESCE(NULLIF(m.media_caption, ''), NULLIF(m.text, ''),
+                                    NULLIF(m.display_text, ''), m.media_type)
+                     FROM messages m
+                     WHERE m.chat_jid = c.jid
+                       AND IFNULL(m.deleted_for_me, 0) = 0
+                       AND IFNULL(m.reaction_to_id, '') = ''
+                     ORDER BY m.ts DESC
+                     LIMIT 1
+                   ) AS preview
+            FROM chats c
+            LEFT JOIN groups g ON g.jid = c.jid
+            LEFT JOIN contacts ct ON ct.jid = c.jid
+            WHERE (
+                    c.kind IN ('dm', 'group')
+                    OR (c.kind = 'unknown' AND c.jid LIKE '%@lid'
+                        AND c.last_message_ts IS NOT NULL AND IFNULL(c.name, '') <> '')
+                  )
+              AND IFNULL(g.is_parent, 0) = 0
+              AND IFNULL(g.linked_parent_jid, '') = ''
+            ORDER BY c.pinned DESC, c.last_message_ts DESC
+            """
+        ).fetchall()
+        out = []
+        for row in rows:
+            if not include_archived and row["archived"]:
+                continue
+            name = pick_name(
+                row["group_name"],
+                row["contact_full"],
+                row["contact_business"],
+                row["contact_push"],
+                row["contact_first"],
+                row["chat_name"],
+                jid=row["jid"],
+            )
+            preview = human_preview(row["preview"] or "")
+            if needle and needle not in name.lower() and needle not in preview.lower():
+                continue
+            last_ts = int(row["last_message_ts"] or 0)
+            ack = int(acks.get(row["jid"], 0) or 0)
+            if last_ts <= ack or not row["unread"]:
+                # wacli's `unread` flag mirrors WhatsApp app state, so a 0 here
+                # means the chat was read on another device (e.g. the phone).
+                unread = 0
+            elif ack > 0:
+                unread = unread_since(con, row["jid"], ack)
+            else:
+                unread = int(row["unread_count"] or 0)
+            kind = row["kind"] if row["kind"] in {"dm", "group"} else "dm"  # @lid chats
+            out.append(
+                {
+                    "jid": row["jid"],
+                    "kind": kind,
+                    "isGroup": kind == "group",
+                    "name": name,
+                    "lastMessageTs": last_ts,
+                    "archived": bool(row["archived"]),
+                    "pinned": bool(row["pinned"]),
+                    "muted": is_muted(int(row["muted_until"] or 0), now),
+                    "unreadCount": unread,
+                    "preview": preview,
+                    "avatarUrl": cached_avatar_url(row["jid"]),
+                }
+            )
+            if len(out) >= limit:
+                break
+
+        # Stitch LID and phone-number chats: WhatsApp treats them as one thread.
+        lmap = lid_pn_map(store)
+        present = {c["jid"] for c in out}
+        out = [c for c in out
+               if not (c["jid"].endswith("@lid") and lmap.get(c["jid"]) in present)]
+        for chat in out:
+            lid = lmap.get(chat["jid"])
+            if not lid or not lid.endswith("@lid"):
+                continue
+            tail = con.execute(
+                """
+                SELECT ts, COALESCE(NULLIF(media_caption, ''), NULLIF(text, ''),
+                       NULLIF(display_text, ''), media_type) AS preview
+                FROM messages
+                WHERE chat_jid = ? AND IFNULL(deleted_for_me, 0) = 0
+                  AND IFNULL(reaction_to_id, '') = ''
+                ORDER BY ts DESC LIMIT 1
+                """,
+                (lid,),
+            ).fetchone()
+            if tail and int(tail["ts"] or 0) > chat["lastMessageTs"]:
+                chat["lastMessageTs"] = int(tail["ts"])
+                merged_preview = human_preview(tail["preview"] or "")
+                if merged_preview:
+                    chat["preview"] = merged_preview
+        out.sort(key=lambda c: (bool(c["pinned"]), c["lastMessageTs"]), reverse=True)
+        return out
+    finally:
+        con.close()
+
+
+def badge_count(chats: list[dict], prefs: dict) -> int:
+    acks = prefs.get("acks") or {}
+    total = 0
+    for chat in chats:
+        if chat.get("muted") or chat.get("archived"):
+            continue
+        ack = int(acks.get(chat["jid"], 0) or 0)
+        if chat["lastMessageTs"] > ack and chat.get("unreadCount", 0) > 0:
+            total += 1
+    return total
+
+
+def _collect_reactions(con: sqlite3.Connection, jids: list[str], ids: list[str]) -> dict[str, list[dict]]:
+    """Map msg_id -> [{emoji, count, mine, who}], newest reaction per sender wins."""
+    if not ids:
+        return {}
+    iph = ",".join("?" * len(ids))
+    jph = ",".join("?" * len(jids))
+    rows = con.execute(
+        f"""
+        SELECT m.reaction_to_id AS tid, m.reaction_emoji AS emoji,
+               m.sender_jid AS sender, m.from_me AS mine,
+               COALESCE(NULLIF(c.full_name, ''), NULLIF(c.push_name, ''),
+                        NULLIF(c.first_name, ''), NULLIF(m.sender_name, '')) AS name
+        FROM messages m
+        LEFT JOIN contacts c ON c.jid = m.sender_jid
+        WHERE m.chat_jid IN ({jph}) AND m.reaction_to_id IN ({iph})
+        ORDER BY m.ts
+        """,
+        [*jids, *ids],
+    ).fetchall()
+    latest: dict[tuple[str, str], tuple[str, bool, str]] = {}
+    for r in rows:
+        key = (r["tid"], r["sender"] or ("me" if r["mine"] else ""))
+        who = "You" if r["mine"] else str(r["name"] or "").strip()
+        latest[key] = ((r["emoji"] or "").strip(), bool(r["mine"]), who)
+    out: dict[str, list[dict]] = {}
+    for (tid, _sender), (emoji, mine, who) in latest.items():
+        if not emoji:
+            continue
+        bucket = out.setdefault(tid, [])
+        for entry in bucket:
+            if entry["emoji"] == emoji:
+                entry["count"] += 1
+                entry["mine"] = entry["mine"] or mine
+                if who:
+                    entry["who"].append(who)
+                break
+        else:
+            bucket.append({"emoji": emoji, "count": 1, "mine": mine, "who": [who] if who else []})
+    for bucket in out.values():
+        bucket.sort(key=lambda e: -e["count"])
+    return out
+
+
+def _coalesce_reactions(entries: list[dict]) -> list[dict]:
+    """Merge reaction buckets that share an emoji (album stub folded into a photo)."""
+    out: dict[str, dict] = {}
+    for e in entries:
+        cur = out.get(e["emoji"])
+        if cur:
+            cur["count"] += e["count"]
+            cur["mine"] = cur["mine"] or e["mine"]
+            cur["who"] = cur["who"] + e.get("who", [])
+        else:
+            out[e["emoji"]] = dict(e)
+    return sorted(out.values(), key=lambda e: -e["count"])
+
+
+def list_messages(store: Path, jid: str, limit: int = 80, before: int | None = None) -> list[dict]:
+    limit = max(1, min(int(limit), MAX_MESSAGES))
+    con = open_db(store)
+    try:
+        require_chat(con, jid)
+        sibs = sibling_jids(store, jid)
+        jph = ",".join("?" * len(sibs))
+        params: list = [*sibs]
+        clause = ""
+        if before:
+            clause = "AND m.ts < ?"
+            params.append(int(before))
+        params.append(limit)
+        rows = con.execute(
+            f"""
+            SELECT m.msg_id, m.chat_jid, m.ts, m.from_me, m.sender_jid, m.sender_name,
+                   m.text, m.display_text, m.quoted_msg_id, m.quoted_sender_jid,
+                   m.is_forwarded, m.edited, m.media_type, m.media_caption, m.filename,
+                   m.mime_type, m.file_length, m.local_path, m.downloaded_at,
+                   m.media_unavailable_at, m.revoked,
+                   q.text AS quoted_text, q.display_text AS quoted_display,
+                   q.sender_name AS quoted_sender_name, q.media_type AS quoted_media,
+                   q.sender_jid AS quoted_real_sender,
+                   loc.name AS loc_name, loc.address AS loc_address,
+                   loc.latitude AS loc_lat, loc.longitude AS loc_lng,
+                   sc.full_name AS sender_full, sc.push_name AS sender_push,
+                   sc.business_name AS sender_business, sc.first_name AS sender_first,
+                   qc.full_name AS quoted_full, qc.push_name AS quoted_push,
+                   qc.business_name AS quoted_business, qc.first_name AS quoted_first
+            FROM messages m
+            LEFT JOIN messages q
+              ON q.chat_jid = m.chat_jid AND q.msg_id = m.quoted_msg_id
+            LEFT JOIN message_locations loc
+              ON loc.chat_jid = m.chat_jid AND loc.msg_id = m.msg_id
+            LEFT JOIN contacts sc ON sc.jid = m.sender_jid
+            LEFT JOIN contacts qc ON qc.jid = COALESCE(NULLIF(q.sender_jid, ''), m.quoted_sender_jid)
+            WHERE m.chat_jid IN ({jph})
+              AND IFNULL(m.deleted_for_me, 0) = 0
+              AND IFNULL(m.reaction_to_id, '') = ''
+              {clause}
+            ORDER BY m.ts DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        reactions = _collect_reactions(con, sibs, [r["msg_id"] for r in rows])
+    finally:
+        con.close()
+    cache = load_link_cache()
+    items = []
+    pending_reax: list[dict] = []  # reactions from album-stub rows, awaiting a photo
+    pending_sender = ""
+    for row in reversed(rows):
+        kind = media_kind(row["media_type"], row["mime_type"])
+        text, caption = visible_body(row["display_text"] or "", row["text"] or "", row["media_caption"] or "", kind)
+        if row["revoked"]:
+            kind = "revoked"
+            text = "This message was deleted"
+            caption = ""
+        local = str(row["local_path"] or "").strip()
+        if not local or not Path(local).is_file():
+            local = cached_media(row["chat_jid"], row["msg_id"])
+        quoted = str(row["quoted_display"] or row["quoted_text"] or "").strip()
+        quoted_kind = media_kind(row["quoted_media"], "") if row["quoted_media"] else "text"
+        quoted_body, _quoted_caption = visible_body(quoted, row["quoted_text"] or "", "", quoted_kind)
+        quoted = quoted_body or placeholder_label(quoted) or quoted
+        if not quoted and row["quoted_media"]:
+            quoted = placeholder_label(row["quoted_media"]) or quoted_kind
+        sender_jid = row["sender_jid"] or ""
+        quoted_jid = row["quoted_real_sender"] or row["quoted_sender_jid"] or ""
+        # WhatsApp album containers are stored as content-less stub rows; they'd
+        # render as blank bubbles. Drop them and carry any reaction (e.g. a heart
+        # on the album) onto the album's first photo from the same sender.
+        if not (text or caption or row["media_type"] or row["loc_name"]
+                or row["revoked"] or row["quoted_msg_id"]):
+            pending_reax += reactions.get(row["msg_id"], [])
+            pending_sender = sender_jid
+            continue
+        row_reax = reactions.get(row["msg_id"], [])
+        if pending_reax and sender_jid == pending_sender:
+            row_reax = _coalesce_reactions(pending_reax + row_reax)
+            pending_reax = []
+        preview = attach_link_preview(text or caption, cache)
+        items.append(
+            {
+                "id": row["msg_id"],
+                "chatJid": jid,  # canonical: siblings (@lid) fold into the requested chat
+                "ts": int(row["ts"] or 0),
+                "fromMe": bool(row["from_me"]),
+                "senderJid": sender_jid,
+                "senderName": pick_name(
+                    row["sender_name"],
+                    row["sender_full"],
+                    row["sender_business"],
+                    row["sender_push"],
+                    row["sender_first"],
+                    jid=sender_jid,
+                )
+                if sender_jid
+                else str(row["sender_name"] or "").strip(),
+                "text": text,
+                "caption": caption,
+                "kind": kind if (row["media_type"] or row["loc_name"] or kind == "revoked") else "text",
+                "quotedId": row["quoted_msg_id"] or "",
+                "quotedSender": pick_name(
+                    row["quoted_sender_name"],
+                    row["quoted_full"],
+                    row["quoted_business"],
+                    row["quoted_push"],
+                    row["quoted_first"],
+                    jid=quoted_jid,
+                )
+                if (row["quoted_sender_name"] or quoted_jid)
+                else "",
+                "quotedText": quoted[:280],
+                "forwarded": bool(row["is_forwarded"]),
+                "edited": bool(row["edited"]),
+                "filename": str(row["filename"] or "").strip(),
+                "mimeType": str(row["mime_type"] or "").strip(),
+                "fileLength": int(row["file_length"] or 0),
+                "localPath": local,
+                "fileUrl": file_url(local) if local and Path(local).is_file() else "",
+                "thumbUrl": file_url(video_thumb(local)) if kind == "video" else "",
+                "downloaded": bool(local and Path(local).is_file()),
+                "unavailable": bool(row["media_unavailable_at"]),
+                "reactions": row_reax,
+                "myReaction": next((e["emoji"] for e in row_reax if e["mine"]), ""),
+                "locationName": str(row["loc_name"] or "").strip(),
+                "locationAddress": str(row["loc_address"] or "").strip(),
+                "latitude": row["loc_lat"],
+                "longitude": row["loc_lng"],
+                "linkPreview": preview,
+            }
+        )
+    if pending_reax and items:  # stub was the newest row: fall back to the prior message
+        merged = _coalesce_reactions(items[-1]["reactions"] + pending_reax)
+        items[-1]["reactions"] = merged
+        items[-1]["myReaction"] = next((e["emoji"] for e in merged if e["mine"]), "")
+    return items
+
+
+def list_participants(store: Path, jid: str) -> list[dict]:
+    con = open_db(store)
+    try:
+        chat = require_chat(con, jid)
+        if chat["kind"] != "group":
+            return []
+        rows = con.execute(
+            """
+            SELECT p.user_jid, p.role,
+                   COALESCE(NULLIF(c.full_name, ''), NULLIF(c.push_name, ''),
+                            NULLIF(c.first_name, ''), p.user_jid) AS name
+            FROM group_participants p
+            LEFT JOIN contacts c ON c.jid = p.user_jid
+            WHERE p.group_jid = ?
+            ORDER BY name COLLATE NOCASE
+            LIMIT ?
+            """,
+            (jid, MAX_PARTICIPANTS),
+        ).fetchall()
+    finally:
+        con.close()
+    out = []
+    for row in rows:
+        out.append(
+            {
+                "jid": row["user_jid"],
+                "name": pick_name(row["name"], jid=row["user_jid"]),
+                "role": row["role"] or "",
+            }
+        )
+    return out
+
+
+def validate_mentions(store: Path, chat_jid: str, mentions: list[str]) -> list[str]:
+    if not mentions:
+        return []
+    allowed = {p["jid"] for p in list_participants(store, chat_jid)}
+    out = []
+    seen = set()
+    for raw in mentions:
+        jid = require_jid(raw)
+        if jid not in allowed:
+            fail("mention is not a member of this group")
+        if jid not in seen:
+            seen.add(jid)
+            out.append(jid)
+    return out
+
+
+def validate_file(path_str: str) -> Path:
+    path = Path(path_str).expanduser()
+    if not path.is_absolute():
+        fail("file path must be absolute")
+    try:
+        path = path.resolve(strict=True)
+    except OSError:
+        fail("file does not exist")
+    if not path.is_file() or path.is_symlink():
+        fail("path is not a regular file")
+    st = path.stat()
+    if not stat.S_ISREG(st.st_mode):
+        fail("path is not a regular file")
+    if st.st_size > MAX_FILE:
+        fail("file is larger than 100 MiB")
+    if st.st_size <= 0:
+        fail("file is empty")
+    return path
+
+
+def is_ogg_opus(path: Path) -> bool:
+    try:
+        data = path.read_bytes()[:1024]
+    except OSError:
+        return False
+    return data.startswith(b"OggS") and b"OpusHead" in data
+
+
+def transcode_voice(path: Path) -> Path:
+    if is_ogg_opus(path):
+        return path
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        fail("voice notes must be OGG/Opus")
+    dest = state_dir() / "voice-drafts" / (secrets.token_hex(16) + ".ogg")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(dest.parent, 0o700)
+    cmd = [
+        ffmpeg, "-y", "-i", str(path),
+        "-c:a", "libopus", "-b:a", "24k", "-ac", "1", "-ar", "48000",
+        str(dest),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=60, check=False)
+    except subprocess.TimeoutExpired:
+        fail("could not convert the voice note")
+    if proc.returncode != 0 or not is_ogg_opus(dest):
+        dest.unlink(missing_ok=True)
+        fail("could not convert the voice note to OGG/Opus")
+    os.chmod(dest, 0o600)
+    return dest
+
+
+def send_text(store: Path, jid: str, message: str, reply_to: str = "", mentions: list[str] | None = None) -> dict:
+    text = message.replace("\r\n", "\n")
+    if not text.strip():
+        fail("message is empty")
+    if len(text) > MAX_TEXT:
+        fail("message is longer than 4096 characters")
+    con = open_db(store)
+    try:
+        require_chat(con, jid)
+    finally:
+        con.close()
+    args = ["send", "text", "--to", jid, "--message", text]
+    if reply_to:
+        args.extend(["--reply-to", reply_to])
+    for mention in validate_mentions(store, jid, mentions or []):
+        args.extend(["--mention", mention])
+    return run_wacli(args, store=store, timeout=90)
+
+
+def send_file(store: Path, jid: str, path_str: str, caption: str = "", as_type: str = "auto") -> dict:
+    path = validate_file(path_str)
+    con = open_db(store)
+    try:
+        require_chat(con, jid)
+    finally:
+        con.close()
+    if len(caption) > MAX_TEXT:
+        fail("caption is too long")
+    args = ["send", "file", "--to", jid, "--file", str(path), "--as", as_type or "auto"]
+    if caption.strip():
+        args.extend(["--caption", caption])
+    return run_wacli(args, store=store, timeout=180)
+
+
+def send_voice(store: Path, jid: str, path_str: str, reply_to: str = "") -> dict:
+    path = transcode_voice(validate_file(path_str))
+    con = open_db(store)
+    try:
+        require_chat(con, jid)
+    finally:
+        con.close()
+    args = ["send", "voice", "--to", jid, "--file", str(path)]
+    if reply_to:
+        args.extend(["--reply-to", reply_to])
+    result = run_wacli(args, store=store, timeout=120)
+    if path.parent == state_dir() / "voice-drafts":
+        path.unlink(missing_ok=True)
+    return result
+
+
+def _existing_media(local: str) -> str:
+    local = str(local or "").strip()
+    return local if local and Path(local).is_file() else ""
+
+
+def _resolve_download(dest: Path) -> Path:
+    if dest.is_file() and dest.stat().st_size > 0:
+        return dest
+    if dest.is_dir():
+        files = [p for p in dest.iterdir() if p.is_file() and p.stat().st_size > 0]
+        if files:
+            return max(files, key=lambda p: p.stat().st_mtime)
+    siblings = [p for p in dest.parent.glob(dest.name + "*") if p.is_file() and p.stat().st_size > 0]
+    if siblings:
+        return max(siblings, key=lambda p: p.stat().st_mtime)
+    fail("could not download that media")
+    raise AssertionError
+
+
+def download_media(store: Path, jid: str, msg_id: str) -> dict:
+    sibs = sibling_jids(store, jid)
+    con = open_db(store)
+    try:
+        require_chat(con, jid)
+        jph = ",".join("?" * len(sibs))
+        row = con.execute(
+            f"SELECT msg_id, chat_jid, local_path, mime_type, media_type, filename "
+            f"FROM messages WHERE chat_jid IN ({jph}) AND msg_id = ?",
+            (*sibs, msg_id),
+        ).fetchone()
+        if row is None:
+            fail("that message is not in this chat")
+    finally:
+        con.close()
+    jid = row["chat_jid"]  # the sibling (@lid) the message actually lives in
+    kind = media_kind(row["media_type"], row["mime_type"])
+    local = _existing_media(row["local_path"]) or cached_media(jid, msg_id)
+    if local:
+        return {
+            "id": msg_id,
+            "localPath": local,
+            "fileUrl": file_url(local),
+            "thumbUrl": file_url(video_thumb(local)) if kind == "video" else "",
+            "mimeType": str(row["mime_type"] or ""),
+            "kind": kind,
+            "filename": str(row["filename"] or ""),
+        }
+    folder = state_dir() / "media"
+    folder.mkdir(parents=True, exist_ok=True)
+    os.chmod(folder, 0o700)
+    dest = folder / (media_key(jid, msg_id) + media_ext(str(row["mime_type"] or ""), str(row["filename"] or ""), kind))
+    run_wacli(
+        ["media", "download", "--chat", jid, "--id", msg_id, "--output", str(dest)],
+        store=store,
+        timeout=180,
+        readonly=True,
+    )
+    local_path = _resolve_download(dest)
+    os.chmod(local_path, 0o600)
+    remember_media(jid, msg_id, local_path)
+    return {
+        "id": msg_id,
+        "localPath": str(local_path),
+        "fileUrl": file_url(str(local_path)),
+        "thumbUrl": file_url(video_thumb(str(local_path))) if kind == "video" else "",
+        "mimeType": str(row["mime_type"] or ""),
+        "kind": kind,
+        "filename": str(row["filename"] or Path(local_path).name),
+    }
+
+
+def send_react(store: Path, jid: str, msg_id: str, sender: str, emoji: str) -> dict:
+    sibs = sibling_jids(store, jid)
+    con = open_db(store)
+    try:
+        require_chat(con, jid)
+        jph = ",".join("?" * len(sibs))
+        row = con.execute(
+            f"SELECT chat_jid, sender_jid, from_me FROM messages "
+            f"WHERE chat_jid IN ({jph}) AND msg_id = ?",
+            (*sibs, msg_id),
+        ).fetchone()
+    finally:
+        con.close()
+    if row is None:
+        fail("that message is not in this chat")
+    args = ["send", "react", "--to", row["chat_jid"], "--id", msg_id, "--reaction", emoji]
+    target = (sender or (row["sender_jid"] or "")).strip()
+    if target and not row["from_me"]:
+        args.extend(["--sender", target])
+    return run_wacli(args, store=store, timeout=60)
+
+
+def sync_active() -> bool:
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "is-active", "wacli-sync.service"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return proc.stdout.decode().strip() == "active"
+
+
+def cmd_sync(action: str) -> dict:
+    if action not in {"start", "stop", "status"}:
+        fail("unknown sync action")
+    if action == "status":
+        return {"active": sync_active()}
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", action, "wacli-sync.service"],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        fail("could not talk to systemd")
+    if proc.returncode != 0:
+        fail("could not " + action + " background sync")
+    return {"active": sync_active()}
+
+
+def cmd_status(store: Path) -> dict:
+    prefs = load_prefs()
+    authenticated = False
+    connected = False
+    connection_state = ""
+    try:
+        data = run_wacli(["doctor", "--read-only"], store=store, timeout=10, readonly=True)
+        authenticated = bool(data.get("authenticated"))
+        connected = bool(data.get("connected"))
+        connection_state = str(data.get("connection_state") or "")
+    except HelperError:
+        authenticated = db_path(store).is_file()
+    chats = []
+    if db_path(store).is_file():
+        try:
+            chats = list_chats(store, limit=MAX_CHATS)
+        except HelperError:
+            chats = []
+    return {
+        "authenticated": authenticated,
+        "connected": connected,
+        "connectionState": connection_state,
+        "storeDir": str(store),
+        "syncActive": sync_active(),
+        "receipts": bool(prefs.get("receipts")),
+        "acks": prefs.get("acks") or {},
+        "unreadBadge": badge_count(chats, prefs),
+        "chatCount": len(chats),
+    }
+
+
+def cmd_ack(jid: str, ts: int) -> dict:
+    prefs = load_prefs()
+    acks = dict(prefs.get("acks") or {})
+    acks[jid] = int(ts)
+    prefs["acks"] = acks
+    save_prefs(prefs)
+    return {"acks": acks}
+
+
+def cmd_receipts(enabled: bool) -> dict:
+    prefs = load_prefs()
+    prefs["receipts"] = bool(enabled)
+    save_prefs(prefs)
+    return {"receipts": prefs["receipts"]}
+
+
+def cmd_mark_read(store: Path, jid: str, ts: int = 0) -> dict:
+    con = open_db(store)
+    try:
+        chat = require_chat(con, jid)
+        ts = max(int(ts or 0), int(chat["last_message_ts"] or 0))
+    finally:
+        con.close()
+    result = cmd_ack(jid, ts)  # persist locally first, before the wacli round-trip
+    run_wacli(["chats", "mark-read", "--chat", jid], store=store, timeout=30, lock_wait="0s")
+    return result
+
+
+def cmd_voice_path() -> dict:
+    folder = state_dir() / "voice-drafts"
+    folder.mkdir(parents=True, exist_ok=True)
+    os.chmod(folder, 0o700)
+    path = folder / (secrets.token_hex(16) + ".ogg")
+    path.touch(mode=0o600)
+    return {"path": str(path), "fileUrl": file_url(str(path))}
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _clipboard_text() -> str:
+    wl = shutil.which("wl-paste")
+    if not wl:
+        return ""
+    try:
+        proc = subprocess.run([wl, "-n"], capture_output=True, timeout=2, check=False)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0 or not proc.stdout:
+        return ""
+    return proc.stdout.decode("utf-8", errors="replace")
+
+
+def _set_clipboard(text: str) -> None:
+    wl = shutil.which("wl-copy")
+    if not wl:
+        return
+    try:
+        subprocess.run(
+            [wl, "--type", "text/plain"],
+            input=text.encode("utf-8"),
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return
+
+
+def _emoji_overlay_open() -> bool:
+    try:
+        proc = subprocess.run(
+            ["hyprctl", "-j", "layers"],
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return b"omarchy-emojis" in (proc.stdout or b"")
+
+
+def _summon_emoji_picker() -> None:
+    shell = shutil.which("omarchy-shell")
+    if not shell:
+        fail("omarchy-shell is not installed")
+    proc = subprocess.run(
+        [shell, "shell", "summon", "omarchy.emojis", "{}"],
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    if proc.returncode != 0:
+        fail("could not open emoji menu")
+
+
+def reaction_from_clipboard(text: str) -> str:
+    s = (text or "").strip()
+    if not s or "\n" in s or len(s) > 32:
+        return ""
+    return s
+
+
+def cmd_pick_emoji(*, watch_only: bool = False) -> dict:
+    """Open the Omarchy emoji overlay and return the chosen glyph.
+
+    The overlay copies via wl-copy then pastes with wtype; we watch the
+    clipboard. ponytail: empty the clipboard first so picking the already-
+    copied emoji still registers; restore on cancel.
+
+    watch_only: the GUI already summoned the overlay (so it appears without
+    waiting for this helper). Summoning again would toggle it closed.
+    """
+    old = _clipboard_text()
+    seen = False
+    if watch_only:
+        appear = time.monotonic() + 2
+        while time.monotonic() < appear:
+            if _emoji_overlay_open():
+                seen = True
+                break
+            got = reaction_from_clipboard(_clipboard_text())
+            if got:
+                return {"emoji": got}
+            _sleep(0.05)
+        if not seen:
+            got = reaction_from_clipboard(_clipboard_text())
+            return {"emoji": got}
+        _set_clipboard("")
+    else:
+        _set_clipboard("")
+        _summon_emoji_picker()
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        if _emoji_overlay_open():
+            seen = True
+        got = reaction_from_clipboard(_clipboard_text())
+        if got:
+            return {"emoji": got}
+        if seen and not _emoji_overlay_open():
+            _sleep(0.3)
+            got = reaction_from_clipboard(_clipboard_text())
+            if got:
+                return {"emoji": got}
+            if not watch_only:
+                _set_clipboard(old)
+            return {"emoji": ""}
+        _sleep(0.05)
+    if not watch_only:
+        _set_clipboard(old)
+    return {"emoji": ""}
+
+
+def cmd_pick_files() -> dict:
+    zenity = shutil.which("zenity")
+    if not zenity:
+        fail("zenity is not installed")
+    proc = subprocess.run(
+        [zenity, "--file-selection", "--multiple", "--separator=\n", "--title=Attach files"],
+        capture_output=True,
+        timeout=300,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return {"files": []}
+    files = []
+    for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        path = validate_file(line)
+        files.append({"path": str(path), "fileUrl": file_url(str(path)), "name": path.name})
+        if len(files) >= MAX_FILES:
+            break
+    return {"files": files}
+
+
+def cmd_clipboard() -> dict:
+    wl = shutil.which("wl-paste")
+    if not wl:
+        fail("wl-clipboard is not installed")
+    types = subprocess.run([wl, "-l"], capture_output=True, timeout=5, check=False)
+    listed = types.stdout.decode("utf-8", errors="replace").splitlines()
+    image_type = ""
+    for candidate in ("image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"):
+        if candidate in listed:
+            image_type = candidate
+            break
+    if image_type:
+        ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}[image_type]
+        folder = state_dir() / "clipboard"
+        folder.mkdir(parents=True, exist_ok=True)
+        os.chmod(folder, 0o700)
+        dest = folder / (secrets.token_hex(16) + ext)
+        proc = subprocess.run([wl, "-t", image_type], capture_output=True, timeout=10, check=False)
+        if proc.returncode != 0 or not proc.stdout:
+            fail("clipboard image is empty")
+        if len(proc.stdout) > MAX_FILE:
+            fail("clipboard image is too large")
+        dest.write_bytes(proc.stdout)
+        os.chmod(dest, 0o600)
+        return {"kind": "file", "path": str(dest), "fileUrl": file_url(str(dest)), "name": dest.name}
+    text = subprocess.run([wl], capture_output=True, timeout=5, check=False)
+    body = text.stdout.decode("utf-8", errors="replace")
+    if len(body) > MAX_TEXT:
+        fail("clipboard text is too long")
+    return {"kind": "text", "text": body}
+
+
+def cmd_open_file(path_str: str) -> dict:
+    path = validate_file(path_str)
+    opener = shutil.which("xdg-open") or "xdg-open"
+    subprocess.Popen([opener, str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    return {"opened": True}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="whatsapp")
+    parser.add_argument("--store", default=None)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("status")
+
+    chats = sub.add_parser("chats")
+    chats.add_argument("--query", default="")
+    chats.add_argument("--limit", type=int, default=80)
+    chats.add_argument("--include-archived", action="store_true")
+
+    messages = sub.add_parser("messages")
+    messages.add_argument("--chat", required=True)
+    messages.add_argument("--limit", type=int, default=80)
+    messages.add_argument("--before", type=int, default=0)
+
+    parts = sub.add_parser("participants")
+    parts.add_argument("--chat", required=True)
+
+    send = sub.add_parser("send-text")
+    send.add_argument("--chat", required=True)
+    send.add_argument("--message", required=True)
+    send.add_argument("--reply-to", default="")
+    send.add_argument("--mention", action="append", default=[])
+
+    sendf = sub.add_parser("send-file")
+    sendf.add_argument("--chat", required=True)
+    sendf.add_argument("--file", required=True)
+    sendf.add_argument("--caption", default="")
+    sendf.add_argument("--as", dest="as_type", default="auto")
+
+    sendv = sub.add_parser("send-voice")
+    sendv.add_argument("--chat", required=True)
+    sendv.add_argument("--file", required=True)
+    sendv.add_argument("--reply-to", default="")
+
+    down = sub.add_parser("download")
+    down.add_argument("--chat", required=True)
+    down.add_argument("--id", required=True)
+
+    react = sub.add_parser("react")
+    react.add_argument("--chat", required=True)
+    react.add_argument("--id", required=True)
+    react.add_argument("--sender", default="")
+    react.add_argument("--emoji", required=True)  # "" removes the reaction
+
+    ack = sub.add_parser("ack")
+    ack.add_argument("--chat", required=True)
+    ack.add_argument("--ts", type=int, required=True)
+
+    receipts = sub.add_parser("receipts")
+    receipts.add_argument("--on", action="store_true")
+    receipts.add_argument("--off", action="store_true")
+
+    mark = sub.add_parser("mark-read")
+    mark.add_argument("--chat", required=True)
+    mark.add_argument("--ts", type=int, default=0)
+
+    sync = sub.add_parser("sync")
+    sync.add_argument("action", choices=["start", "stop", "status"])
+
+    sub.add_parser("voice-path")
+    sub.add_parser("pick-files")
+    pick_emoji = sub.add_parser("pick-emoji")
+    pick_emoji.add_argument("--watch-only", action="store_true")
+    sub.add_parser("clipboard")
+
+    openf = sub.add_parser("open-file")
+    openf.add_argument("--file", required=True)
+
+    linkp = sub.add_parser("link-preview")
+    linkp.add_argument("--url", required=True)
+
+    av = sub.add_parser("avatar")
+    av.add_argument("--jid", required=True)
+    return parser
+
+
+def dispatch(args: argparse.Namespace) -> dict:
+    store = store_dir(args.store)
+    prune_media()
+    cmd = args.cmd
+    if cmd == "status":
+        return cmd_status(store)
+    if cmd == "chats":
+        return {
+            "chats": list_chats(store, args.query, args.limit, args.include_archived),
+            "syncActive": sync_active(),
+        }
+    if cmd == "messages":
+        return {"messages": list_messages(store, require_jid(args.chat), args.limit, args.before or None)}
+    if cmd == "participants":
+        return {"participants": list_participants(store, require_jid(args.chat))}
+    if cmd == "send-text":
+        return send_text(store, require_jid(args.chat), args.message, args.reply_to, args.mention)
+    if cmd == "send-file":
+        return send_file(store, require_jid(args.chat), args.file, args.caption, args.as_type)
+    if cmd == "send-voice":
+        return send_voice(store, require_jid(args.chat), args.file, args.reply_to)
+    if cmd == "download":
+        return download_media(store, require_jid(args.chat), args.id)
+    if cmd == "react":
+        return send_react(store, require_jid(args.chat), args.id, args.sender, args.emoji)
+    if cmd == "ack":
+        return cmd_ack(require_jid(args.chat), args.ts)
+    if cmd == "receipts":
+        if args.on == args.off:
+            fail("pass --on or --off")
+        return cmd_receipts(args.on)
+    if cmd == "mark-read":
+        return cmd_mark_read(store, require_jid(args.chat), args.ts)
+    if cmd == "sync":
+        return cmd_sync(args.action)
+    if cmd == "voice-path":
+        return cmd_voice_path()
+    if cmd == "pick-files":
+        return cmd_pick_files()
+    if cmd == "pick-emoji":
+        return cmd_pick_emoji(watch_only=bool(getattr(args, "watch_only", False)))
+    if cmd == "clipboard":
+        return cmd_clipboard()
+    if cmd == "open-file":
+        return cmd_open_file(args.file)
+    if cmd == "link-preview":
+        return cmd_link_preview(args.url)
+    if cmd == "avatar":
+        return cmd_avatar(store, args.jid)
+    fail("unknown command")
+    return {}
+
+
+def run_once(parser: argparse.ArgumentParser, argv: list[str]) -> None:
+    """Parse one command and emit its single JSON response line."""
+    try:
+        args = parser.parse_args(argv)
+        emit({"ok": True, "data": dispatch(args)})
+    except HelperError as err:
+        emit({"ok": False, "error": str(err)})
+    except SystemExit:
+        emit({"ok": False, "error": "bad command"})
+    except Exception:
+        emit({"ok": False, "error": "helper error"})
+
+
+def run_daemon() -> int:
+    """Read newline-delimited JSON argv arrays on stdin, one response per line.
+
+    Lets the GUI keep a single long-lived process instead of paying Python
+    startup on every interaction.
+    """
+    parser = build_parser()
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            argv = [str(x) for x in json.loads(line)]
+        except (json.JSONDecodeError, TypeError, ValueError):
+            emit({"ok": False, "error": "bad command"})
+        else:
+            run_once(parser, argv)
+        try:
+            sys.stdout.flush()
+        except BrokenPipeError:
+            return 0
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "--daemon":
+        try:
+            return run_daemon()
+        except (BrokenPipeError, KeyboardInterrupt):
+            return 0
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+        emit({"ok": True, "data": dispatch(args)})
+        return 0
+    except HelperError as err:
+        emit({"ok": False, "error": str(err)})
+        return err.code
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

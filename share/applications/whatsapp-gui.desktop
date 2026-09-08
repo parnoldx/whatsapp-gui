@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=WhatsApp
+GenericName=WhatsApp client
+Comment=Local-first WhatsApp client that follows the Omarchy theme
+Exec=whatsapp-gui --toggle
+TryExec=whatsapp-gui
+Icon=whatsapp
+Terminal=false
+Categories=Network;InstantMessaging;
+Keywords=whatsapp;chat;wacli;
+StartupNotify=true
+StartupWMClass=whatsapp-gui
+SingleMainWindow=true
