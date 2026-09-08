@@ -5,10 +5,11 @@ Rectangle {
     property string text: ""
     property string kind: "ghost"
     property bool active: true
+    property bool iconOnly: false
     signal clicked()
 
     readonly property bool primary: kind === "primary"
-    implicitWidth: label.implicitWidth + 24
+    implicitWidth: iconOnly ? implicitHeight : label.implicitWidth + 24
     implicitHeight: 32
     radius: Theme.radiusSmall
     opacity: active ? 1 : 0.4
@@ -23,7 +24,7 @@ Rectangle {
         text: root.text
         textFormat: Text.PlainText
         font.family: Theme.fontFamily
-        font.pixelSize: 13
+        font.pixelSize: root.iconOnly ? 16 : 13
         color: root.primary ? Theme.onAccent : Theme.textPrimary
     }
 

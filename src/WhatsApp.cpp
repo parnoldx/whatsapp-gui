@@ -77,6 +77,8 @@ WhatsApp::WhatsApp(QQmlEngine *engine, QObject *parent)
     });
 
     refreshStatus();
+    // Refresh cached profile pictures at most once a day; helper no-ops when fresh.
+    call({QStringLiteral("refresh-avatars")}, QStringLiteral("avatar"));
     updateActivity();
 }
 

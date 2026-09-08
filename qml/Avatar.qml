@@ -1,4 +1,5 @@
 import QtQuick
+import Qt5Compat.GraphicalEffects
 
 Item {
     id: root
@@ -32,7 +33,19 @@ Item {
             fillMode: Image.PreserveAspectCrop
             asynchronous: true
             cache: true
-            visible: status === Image.Ready
+            visible: false
+        }
+
+        // Rectangle clip is square, so round the picture with a mask.
+        OpacityMask {
+            anchors.fill: parent
+            visible: pic.status === Image.Ready
+            source: pic
+            maskSource: Rectangle {
+                width: pic.width
+                height: pic.height
+                radius: pic.width / 2
+            }
         }
     }
 }

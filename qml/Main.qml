@@ -69,8 +69,14 @@ ApplicationWindow {
             return
         }
         win.pinning = true
+        thread.cancelFlick()
         thread.positionViewAtIndex(thread.count - 1, ListView.End)
-        Qt.callLater(function() { win.pinning = false })
+        Qt.callLater(function() {
+            // reposition once layout (async image heights) has settled
+            if (win.stickToEnd && thread.count)
+                thread.positionViewAtIndex(thread.count - 1, ListView.End)
+            win.pinning = false
+        })
     }
 
     function queueSend(msg) {

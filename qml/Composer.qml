@@ -221,27 +221,34 @@ Item {
             }
         }
 
-        Text {
+        RowLayout {
             visible: voice && (voice.recording || voice.previewing)
-            text: voice && voice.recording
-                ? "Recording… " + Math.round((voice.durationMs || 0) / 1000) + "s"
-                : "Voice note ready — Send or discard"
-            textFormat: Text.PlainText
-            color: Theme.accent
-            font.pixelSize: 11
+            width: parent.width
+            spacing: 6
+            Text {
+                Layout.fillWidth: true
+                text: voice && voice.recording
+                    ? "Recording… " + Math.round((voice.durationMs || 0) / 1000) + "s"
+                    : "Voice note ready — Send or discard"
+                textFormat: Text.PlainText
+                color: Theme.accent
+                font.pixelSize: 11
+            }
+            AppButton {
+                visible: !!(voice && voice.previewing)
+                text: "×"
+                iconOnly: true
+                onClicked: if (voice) voice.discard()
+            }
         }
 
         RowLayout {
             width: parent.width
             spacing: 6
-            AppButton { text: "Attach"; onClicked: root.pick() }
             AppButton {
-                text: voice && voice.recording ? "Stop" : "Voice"
-                onClicked: {
-                    if (!voice) return
-                    if (voice.previewing) voice.discard()
-                    else voice.toggle()
-                }
+                text: "+"
+                iconOnly: true
+                onClicked: root.pick()
             }
             Controls.TextArea {
                 id: input
@@ -285,6 +292,16 @@ Item {
                         event.accepted = true
                         root.pick()
                     }
+                }
+            }
+            AppButton {
+                iconOnly: true
+                text: voice && voice.recording ? "\uF04D" : "\uF130"
+                kind: voice && voice.recording ? "primary" : "ghost"
+                onClicked: {
+                    if (!voice) return
+                    if (voice.previewing) voice.discard()
+                    voice.toggle()
                 }
             }
             AppButton { text: "Send"; kind: "primary"; onClicked: root.send() }

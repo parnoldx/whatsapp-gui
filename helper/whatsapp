@@ -742,6 +742,39 @@ def cmd_avatar(store: Path, jid: str) -> dict:
     return {"jid": jid, "localPath": str(local), "fileUrl": file_url(str(local)), "id": pic_id}
 
 
+def cmd_refresh_avatars(store: Path) -> dict:
+    # picture-info needs the store lock, which a running wacli-sync daemon
+    # holds permanently — so pause sync, fetch every chat's avatar, resume.
+    # Rate-limited to one run per day via marker file; the GUI calls this on
+    # startup, no-op when fresh.
+    marker = state_dir() / ".avatars-refresh"
+    if marker.is_file() and time.time() - marker.stat().st_mtime < 86400:
+        return {"skipped": True}
+    was_running = subprocess.run(
+        ["systemctl", "--user", "is-active", "--quiet", "wacli-sync"],
+        check=False,
+    ).returncode == 0
+    if was_running:
+        subprocess.run(["systemctl", "--user", "stop", "wacli-sync"], check=False)
+    try:
+        index = load_avatar_index()
+        for entry in index.values():
+            if isinstance(entry, dict):
+                entry["failedAt"] = 0
+        save_avatar_index(index)
+        jids = [c["jid"] for c in list_chats(store, limit=MAX_CHATS)]
+        for jid in jids:
+            try:
+                cmd_avatar(store, jid)
+            except HelperError:
+                pass
+    finally:
+        if was_running:
+            subprocess.run(["systemctl", "--user", "start", "wacli-sync"], check=False)
+    marker.touch()
+    return {"refreshed": True}
+
+
 def unread_since(con: sqlite3.Connection, jid: str, ack: int) -> int:
     row = con.execute(
         """
@@ -1925,6 +1958,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     av = sub.add_parser("avatar")
     av.add_argument("--jid", required=True)
+
+    sub.add_parser("refresh-avatars")
     return parser
 
 
@@ -1932,6 +1967,10 @@ def dispatch(args: argparse.Namespace) -> dict:
     store = store_dir(args.store)
     prune_media()
     cmd = args.cmd
+    if cmd == "avatar":
+        return cmd_avatar(store, args.jid)
+    if cmd == "refresh-avatars":
+        return cmd_refresh_avatars(store)
     if cmd == "status":
         return cmd_status(store)
     if cmd == "chats":
