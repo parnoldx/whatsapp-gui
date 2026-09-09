@@ -8,10 +8,10 @@ import "Model.js" as Model
 
 ApplicationWindow {
     id: win
-    width: 1100
-    height: 720
-    minimumWidth: 720
-    minimumHeight: 480
+    width: 560
+    height: 900
+    minimumWidth: 360
+    minimumHeight: 400
     visible: true
     title: "WhatsApp"
     color: Theme.windowBg
@@ -414,6 +414,15 @@ ApplicationWindow {
         sequences: ["Ctrl+E"]
         enabled: !!win.chat
         onActivated: win.goToNewest()
+    }
+
+    Shortcut {
+        sequences: ["Escape"]
+        enabled: win.viewer === null
+        onActivated: {
+            if (WhatsApp.selectedJid) WhatsApp.selectedJid = ""
+            else win.hide()
+        }
     }
 
     Connections {
