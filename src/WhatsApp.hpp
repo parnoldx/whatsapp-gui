@@ -73,7 +73,7 @@ public:
     Q_INVOKABLE void setReceipts(bool on);
     Q_INVOKABLE void setOnline(bool on);
     Q_INVOKABLE void sendText(const QString &text, const QVariantList &mentions, const QString &replyId);
-    Q_INVOKABLE void sendFile(const QString &path, const QString &caption);
+    Q_INVOKABLE void sendFile(const QString &path, const QString &caption, const QString &replyId);
     Q_INVOKABLE void sendVoice(const QString &path, const QString &replyId);
     Q_INVOKABLE void download(const QVariantMap &message);
     Q_INVOKABLE void react(const QVariantMap &message, const QString &emoji);

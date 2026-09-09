@@ -34,6 +34,8 @@ MAX_FILES = 10
 WACLI = os.environ.get("WACLI_BIN", "wacli")
 JID_RE = re.compile(r"^[A-Za-z0-9._:-]+@[A-Za-z0-9._-]+$")
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
+# WhatsApp stores @mentions as @<lid> or @<phone>; both are 8+ digits.
+MENTION_ID_RE = re.compile(r"@(\d{8,})\b")
 MEDIA_KINDS = {"image", "video", "gif", "sticker", "voice", "audio", "document"}
 ALBUM_MEDIA = {"image", "video", "gif"}
 ALBUM_RE = re.compile(r"^\[Album:\s*(\d+)\s+\w+\]$", re.I)
@@ -287,6 +289,103 @@ def pick_name(*parts: object, jid: str = "") -> str:
     return fallback_from_jid(jid)
 
 
+def _real_person_name(*parts: object, jid: str = "") -> str:
+    """pick_name, but empty when we'd only have a number or JID."""
+    name = pick_name(*parts, jid=jid)
+    if not name or looks_like_id(name, jid) or name.lstrip("+").isdigit():
+        return ""
+    return name
+
+
+def mention_ids_in(*texts: object) -> set[str]:
+    ids: set[str] = set()
+    for text in texts:
+        if text:
+            ids.update(MENTION_ID_RE.findall(str(text)))
+    return ids
+
+
+def load_mention_names(
+    store: Path, ids: set[str], con: sqlite3.Connection | None = None
+) -> dict[str, str]:
+    """Map the numeric local-part of an @mention to a contact name."""
+    idents = {str(i) for i in ids if i}
+    if not idents:
+        return {}
+    lmap = lid_pn_map(store)
+    jids: list[str] = []
+    seen_jids: set[str] = set()
+    for ident in idents:
+        for jid in (f"{ident}@lid", f"{ident}@s.whatsapp.net"):
+            for candidate in (jid, lmap.get(jid) or ""):
+                if candidate and candidate not in seen_jids:
+                    seen_jids.add(candidate)
+                    jids.append(candidate)
+    own = con is None
+    if own:
+        con = open_db(store)
+    try:
+        clauses = []
+        params: list[str] = []
+        if jids:
+            clauses.append(f"jid IN ({','.join('?' * len(jids))})")
+            params.extend(jids)
+        clauses.append(f"phone IN ({','.join('?' * len(idents))})")
+        params.extend(idents)
+        rows = con.execute(
+            f"""
+            SELECT jid, phone, full_name, business_name, push_name, first_name
+            FROM contacts
+            WHERE {' OR '.join(clauses)}
+            """,
+            params,
+        ).fetchall()
+    finally:
+        if own:
+            con.close()
+    by_jid: dict[str, str] = {}
+    by_phone: dict[str, str] = {}
+    for row in rows:
+        name = _real_person_name(
+            row["full_name"],
+            row["business_name"],
+            row["push_name"],
+            row["first_name"],
+            jid=row["jid"],
+        )
+        if not name:
+            continue
+        by_jid[row["jid"]] = name
+        phone = str(row["phone"] or "").strip()
+        if phone:
+            by_phone[phone] = name
+    out: dict[str, str] = {}
+    for ident in idents:
+        if ident in by_phone:
+            out[ident] = by_phone[ident]
+            continue
+        for jid in (f"{ident}@lid", f"{ident}@s.whatsapp.net"):
+            if jid in by_jid:
+                out[ident] = by_jid[jid]
+                break
+            sib = lmap.get(jid)
+            if sib and sib in by_jid:
+                out[ident] = by_jid[sib]
+                break
+    return out
+
+
+def apply_mention_names(text: str, names: dict[str, str]) -> str:
+    if not text or not names:
+        return text or ""
+
+    def repl(match: re.Match[str]) -> str:
+        name = names.get(match.group(1))
+        return f"@{name}" if name else match.group(0)
+
+    return MENTION_ID_RE.sub(repl, text)
+
+
 def album_count(text: str) -> int:
     match = ALBUM_RE.match(str(text or "").strip())
     return int(match.group(1)) if match else 0
@@ -393,10 +492,12 @@ def embed_url_for(host: str, url: str) -> str:
         return f"https://www.youtube.com/embed/{vid}" if vid else ""
     if h in {"x.com", "twitter.com"}:
         match = re.search(r"/(?:i/web/)?status/(\d+)", path)
+        if not match:
+            return ""
+        if "/video/" in path:
+            return f"https://twitter.com/i/videos/tweet/{match.group(1)}"
         return (
             f"https://platform.twitter.com/embed/Tweet.html?id={match.group(1)}&dnt=true&theme=dark"
-            if match
-            else ""
         )
     if h in {"facebook.com", "fb.watch"}:
         parsed = urlparse(raw)
@@ -789,8 +890,9 @@ def attach_link_preview(text: str, cache: dict | None = None) -> dict:
         for key in ("title", "description", "imageUrl"):
             if cached.get(key):
                 preview[key] = cached[key]
-        if embed_usable(str(cached.get("embedUrl") or "")):
-            preview["embedUrl"] = cached["embedUrl"]
+        cached_embed = str(cached.get("embedUrl") or "")
+        if not embed_usable(preview.get("embedUrl") or "") and embed_usable(cached_embed):
+            preview["embedUrl"] = cached_embed
         if cached.get("title") or cached.get("imageUrl"):
             preview["fetched"] = True
     return preview
@@ -1212,6 +1314,12 @@ def list_chats(store: Path, query: str = "", limit: int = 80, include_archived: 
                      WHERE m.chat_jid = c.jid
                        AND IFNULL(m.deleted_for_me, 0) = 0
                        AND IFNULL(m.reaction_to_id, '') = ''
+                       AND NOT (
+                         IFNULL(m.text, '') = ''
+                         AND IFNULL(m.media_caption, '') = ''
+                         AND IFNULL(m.media_type, '') = ''
+                         AND lower(IFNULL(m.display_text, '')) IN ('(message)', 'message')
+                       )
                      ORDER BY m.ts DESC
                      LIMIT 1
                    ) AS preview
@@ -1289,6 +1397,12 @@ def list_chats(store: Path, query: str = "", limit: int = 80, include_archived: 
                 FROM messages
                 WHERE chat_jid = ? AND IFNULL(deleted_for_me, 0) = 0
                   AND IFNULL(reaction_to_id, '') = ''
+                  AND NOT (
+                    IFNULL(text, '') = ''
+                    AND IFNULL(media_caption, '') = ''
+                    AND IFNULL(media_type, '') = ''
+                    AND lower(IFNULL(display_text, '')) IN ('(message)', 'message')
+                  )
                 ORDER BY ts DESC LIMIT 1
                 """,
                 (lid,),
@@ -1298,6 +1412,13 @@ def list_chats(store: Path, query: str = "", limit: int = 80, include_archived: 
                 merged_preview = human_preview(tail["preview"] or "")
                 if merged_preview:
                     chat["preview"] = merged_preview
+        mention_ids: set[str] = set()
+        for chat in out:
+            mention_ids.update(mention_ids_in(chat.get("preview") or ""))
+        if mention_ids:
+            mention_names = load_mention_names(store, mention_ids, con)
+            for chat in out:
+                chat["preview"] = apply_mention_names(chat["preview"], mention_names)
         out.sort(key=lambda c: (bool(c["pinned"]), c["lastMessageTs"]), reverse=True)
         return out
     finally:
@@ -1471,7 +1592,8 @@ def list_messages(store: Path, jid: str, limit: int = 80, before: int | None = N
     limit = max(1, min(int(limit), MAX_MESSAGES))
     con = open_db(store)
     try:
-        require_chat(con, jid)
+        chat = require_chat(con, jid)
+        is_group = chat["kind"] == "group"
         sibs = sibling_jids(store, jid)
         jph = ",".join("?" * len(sibs))
         params: list = [*sibs]
@@ -1513,6 +1635,18 @@ def list_messages(store: Path, jid: str, limit: int = 80, before: int | None = N
             params,
         ).fetchall()
         reactions = _collect_reactions(con, sibs, [r["msg_id"] for r in rows])
+        mention_ids: set[str] = set()
+        for row in rows:
+            mention_ids.update(
+                mention_ids_in(
+                    row["text"],
+                    row["display_text"],
+                    row["media_caption"],
+                    row["quoted_text"],
+                    row["quoted_display"],
+                )
+            )
+        mention_names = load_mention_names(store, mention_ids, con)
     finally:
         con.close()
     cache = load_link_cache()
@@ -1541,6 +1675,8 @@ def list_messages(store: Path, jid: str, limit: int = 80, before: int | None = N
     for row in reversed(rows):
         kind = media_kind(row["media_type"], row["mime_type"])
         text, caption = visible_body(row["display_text"] or "", row["text"] or "", row["media_caption"] or "", kind)
+        text = apply_mention_names(text, mention_names)
+        caption = apply_mention_names(caption, mention_names)
         if row["revoked"]:
             kind = "revoked"
             text = "This message was deleted"
@@ -1554,12 +1690,17 @@ def list_messages(store: Path, jid: str, limit: int = 80, before: int | None = N
         quoted = quoted_body or placeholder_label(quoted) or quoted
         if not quoted and row["quoted_media"]:
             quoted = placeholder_label(row["quoted_media"]) or quoted_kind
+        quoted = apply_mention_names(quoted, mention_names)
         sender_jid = row["sender_jid"] or ""
         quoted_jid = row["quoted_real_sender"] or row["quoted_sender_jid"] or ""
         labeled = album_count(row["text"] or row["display_text"] or "")
         # WhatsApp album containers are stored as stub rows ([Album: N images]
         # or a content-less "(message)"); they'd render as blank/[Album...]
         # bubbles. Drop them and carry any reaction onto the first photo.
+        # In groups the same empty stub is usually an edit envelope
+        # (secretEncryptedMessage) or sender-key distribution — official
+        # WhatsApp does not show a bubble. Keep a placeholder in DMs so
+        # template-only threads (PayPal) are not blank.
         if labeled or not (text or caption or row["media_type"] or row["loc_name"]
                 or row["revoked"] or row["quoted_msg_id"]):
             if row["msg_id"] in album_stubs or reactions.get(row["msg_id"]):
@@ -1569,7 +1710,7 @@ def list_messages(store: Path, jid: str, limit: int = 80, before: int | None = N
                     pending_album = True
                     pending_album_id = row["msg_id"]
                 continue
-            if labeled:
+            if labeled or is_group:
                 continue
             text = "Unsupported message"
         row_reax = reactions.get(row["msg_id"], [])
@@ -1751,6 +1892,89 @@ def transcode_voice(path: Path) -> Path:
     return dest
 
 
+def quoted_sender(store: Path, jid: str, msg_id: str, con: sqlite3.Connection | None = None) -> str:
+    """Sender JID of a stored message — required by wacli for group replies."""
+    if not msg_id:
+        return ""
+    sibs = sibling_jids(store, jid)
+    own = con is None
+    if own:
+        con = open_db(store)
+    try:
+        jph = ",".join("?" * len(sibs))
+        row = con.execute(
+            f"SELECT sender_jid FROM messages WHERE chat_jid IN ({jph}) AND msg_id = ?",
+            (*sibs, msg_id),
+        ).fetchone()
+    finally:
+        if own:
+            con.close()
+    return str((row["sender_jid"] if row else "") or "").strip()
+
+
+def append_reply_args(args: list[str], store: Path, jid: str, reply_to: str, con: sqlite3.Connection | None = None) -> None:
+    if not reply_to:
+        return
+    args.extend(["--reply-to", reply_to])
+    sender = quoted_sender(store, jid, reply_to, con)
+    if sender:
+        args.extend(["--reply-to-sender", sender])
+
+
+def _sent_msg_id(result: dict) -> str:
+    for key in ("id", "ID", "message_id", "MessageID", "msg_id"):
+        val = result.get(key) if isinstance(result, dict) else None
+        if val:
+            return str(val)
+    return ""
+
+
+def remember_sent_reply(store: Path, jid: str, result: dict, reply_to: str, text: str = "") -> None:
+    """Fill quoted_msg_id when wacli stored the send without the reply."""
+    if not reply_to:
+        return
+    sibs = sibling_jids(store, jid)
+    sender = quoted_sender(store, jid, reply_to)
+    msg_id = _sent_msg_id(result)
+    try:
+        con = sqlite3.connect(db_path(store), timeout=2.0)
+    except sqlite3.Error:
+        return
+    con.row_factory = sqlite3.Row
+    try:
+        jph = ",".join("?" * len(sibs))
+        if not msg_id and text:
+            row = con.execute(
+                f"""
+                SELECT msg_id FROM messages
+                WHERE chat_jid IN ({jph}) AND from_me = 1
+                  AND IFNULL(quoted_msg_id, '') = ''
+                  AND (IFNULL(text, '') = ? OR IFNULL(display_text, '') = ?
+                       OR IFNULL(media_caption, '') = ?)
+                ORDER BY ts DESC LIMIT 1
+                """,
+                (*sibs, text, text, text),
+            ).fetchone()
+            msg_id = str(row["msg_id"] or "") if row else ""
+        if not msg_id:
+            return
+        con.execute(
+            f"""
+            UPDATE messages
+               SET quoted_msg_id = ?,
+                   quoted_sender_jid = COALESCE(NULLIF(quoted_sender_jid, ''), ?)
+             WHERE chat_jid IN ({jph}) AND msg_id = ?
+               AND IFNULL(quoted_msg_id, '') = ''
+            """,
+            (reply_to, sender, *sibs, msg_id),
+        )
+        con.commit()
+    except sqlite3.Error:
+        return
+    finally:
+        con.close()
+
+
 def send_text(store: Path, jid: str, message: str, reply_to: str = "", mentions: list[str] | None = None) -> dict:
     text = message.replace("\r\n", "\n")
     if not text.strip():
@@ -1760,29 +1984,33 @@ def send_text(store: Path, jid: str, message: str, reply_to: str = "", mentions:
     con = open_db(store)
     try:
         require_chat(con, jid)
+        args = ["send", "text", "--to", jid, "--message", text]
+        append_reply_args(args, store, jid, reply_to, con)
     finally:
         con.close()
-    args = ["send", "text", "--to", jid, "--message", text]
-    if reply_to:
-        args.extend(["--reply-to", reply_to])
     for mention in validate_mentions(store, jid, mentions or []):
         args.extend(["--mention", mention])
-    return run_wacli(args, store=store, timeout=90)
+    result = run_wacli(args, store=store, timeout=90)
+    remember_sent_reply(store, jid, result, reply_to, text)
+    return result
 
 
-def send_file(store: Path, jid: str, path_str: str, caption: str = "", as_type: str = "auto") -> dict:
+def send_file(store: Path, jid: str, path_str: str, caption: str = "", as_type: str = "auto", reply_to: str = "") -> dict:
     path = validate_file(path_str)
     con = open_db(store)
     try:
         require_chat(con, jid)
+        if len(caption) > MAX_TEXT:
+            fail("caption is too long")
+        args = ["send", "file", "--to", jid, "--file", str(path), "--as", as_type or "auto"]
+        if caption.strip():
+            args.extend(["--caption", caption])
+        append_reply_args(args, store, jid, reply_to, con)
     finally:
         con.close()
-    if len(caption) > MAX_TEXT:
-        fail("caption is too long")
-    args = ["send", "file", "--to", jid, "--file", str(path), "--as", as_type or "auto"]
-    if caption.strip():
-        args.extend(["--caption", caption])
-    return run_wacli(args, store=store, timeout=180)
+    result = run_wacli(args, store=store, timeout=180)
+    remember_sent_reply(store, jid, result, reply_to, caption)
+    return result
 
 
 def send_voice(store: Path, jid: str, path_str: str, reply_to: str = "") -> dict:
@@ -1793,9 +2021,9 @@ def send_voice(store: Path, jid: str, path_str: str, reply_to: str = "") -> dict
     finally:
         con.close()
     args = ["send", "voice", "--to", jid, "--file", str(path)]
-    if reply_to:
-        args.extend(["--reply-to", reply_to])
+    append_reply_args(args, store, jid, reply_to)
     result = run_wacli(args, store=store, timeout=120)
+    remember_sent_reply(store, jid, result, reply_to)
     if path.parent == state_dir() / "voice-drafts":
         path.unlink(missing_ok=True)
     return result
@@ -2205,6 +2433,7 @@ def build_parser() -> argparse.ArgumentParser:
     sendf.add_argument("--file", required=True)
     sendf.add_argument("--caption", default="")
     sendf.add_argument("--as", dest="as_type", default="auto")
+    sendf.add_argument("--reply-to", default="")
 
     sendv = sub.add_parser("send-voice")
     sendv.add_argument("--chat", required=True)
@@ -2277,7 +2506,7 @@ def dispatch(args: argparse.Namespace) -> dict:
     if cmd == "send-text":
         return send_text(store, require_jid(args.chat), args.message, args.reply_to, args.mention)
     if cmd == "send-file":
-        return send_file(store, require_jid(args.chat), args.file, args.caption, args.as_type)
+        return send_file(store, require_jid(args.chat), args.file, args.caption, args.as_type, args.reply_to)
     if cmd == "send-voice":
         return send_voice(store, require_jid(args.chat), args.file, args.reply_to)
     if cmd == "download":

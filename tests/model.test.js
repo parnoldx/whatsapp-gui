@@ -184,11 +184,25 @@ test("parseLink builds official embed URLs", () => {
     Model.parseLink("https://x.com/BarackObama/status/266031293945503744?s=20").embedUrl,
     "https://platform.twitter.com/embed/Tweet.html?id=266031293945503744&dnt=true&theme=dark"
   )
+  assert.equal(
+    Model.parseLink("https://x.com/TheCinesthetic/status/2096346129726345259/video/1?s=48").embedUrl,
+    "https://twitter.com/i/videos/tweet/2096346129726345259"
+  )
+  assert.equal(
+    Model.parseLink("https://twitter.com/its_The_Dr/status/2095964426096513415/video/1").embedUrl,
+    "https://twitter.com/i/videos/tweet/2095964426096513415"
+  )
   assert.equal(Model.parseLink("https://example.com/x").embedUrl, "")
   const cached = { url: "https://vm.tiktok.com/ZGdxcYD6r/", host: "vm.tiktok.com" }
   assert.equal(Model.linkEmbed(cached), "")
   cached.embedUrl = "https://www.tiktok.com/embed/v3/7662159610396052757"
   assert.equal(Model.linkEmbed(cached), "https://www.tiktok.com/embed/v2/7662159610396052757")
+  const staleX = {
+    url: "https://x.com/foo/status/2096346129726345259/video/1",
+    host: "x.com",
+    embedUrl: "https://platform.twitter.com/embed/Tweet.html?id=2096346129726345259&dnt=true&theme=dark"
+  }
+  assert.equal(Model.linkEmbed(staleX), "https://twitter.com/i/videos/tweet/2096346129726345259")
 })
 
 test("fileKind guesses from the path", () => {
@@ -224,6 +238,43 @@ test("overlayPendingSends shows a bubble until the real row lands", () => {
 
   const already = Model.overlayPendingSends(pending, pending, "a")
   assert.equal(already.messages.length, 1)
+})
+
+test("overlayPendingSends keeps the quote on the surviving bubble", () => {
+  const pending = [Model.pendingMessage({
+    id: "pending:1", chatJid: "g", ts: 100, kind: "text", text: "mach",
+    quotedId: "orig", quotedSender: "Denis", quotedText: "hello"
+  })]
+  const real = [{
+    id: "real", chatJid: "g", fromMe: true, kind: "text", text: "mach", ts: 101
+  }]
+  const done = Model.overlayPendingSends(real, pending, "g")
+  assert.equal(done.messages.length, 1)
+  assert.equal(done.messages[0].id, "real")
+  assert.equal(done.messages[0].quotedId, "orig")
+  assert.equal(done.messages[0].quotedText, "hello")
+  assert.equal(done.messages[0].quotedSender, "Denis")
+  assert.equal(done.pending.length, 1)
+
+  const again = Model.overlayPendingSends(real, done.pending, "g")
+  assert.equal(again.messages[0].quotedText, "hello")
+
+  const stored = [{
+    id: "real", chatJid: "g", fromMe: true, kind: "text", text: "mach",
+    ts: 101, quotedId: "orig", quotedText: "hello", quotedSender: "Denis Saydjari"
+  }]
+  const finished = Model.overlayPendingSends(stored, again.pending, "g")
+  assert.equal(finished.messages.length, 1)
+  assert.equal(finished.pending.length, 0)
+  assert.equal(finished.messages[0].quotedText, "hello")
+
+  const otherQuote = [{
+    id: "real2", chatJid: "g", fromMe: true, kind: "text", text: "mach",
+    ts: 101, quotedId: "someone-else"
+  }]
+  const keep = Model.overlayPendingSends(otherQuote, pending, "g")
+  assert.equal(keep.messages.length, 2)
+  assert.equal(keep.pending.length, 1)
 })
 
 test("mentionToken finds @query at the cursor", () => {

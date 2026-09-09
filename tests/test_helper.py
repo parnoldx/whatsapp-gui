@@ -224,6 +224,48 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(stub["text"], "Unsupported message")
         self.assertFalse(messages[0].get("album"))
 
+    def test_group_empty_stub_is_hidden(self):
+        # Edits/key-distribution arrive as content-less "(message)" rows.
+        # Official WhatsApp does not show a bubble for them.
+        con = sqlite3.connect(self.db)
+        con.execute(
+            """INSERT INTO messages (
+                 chat_jid, chat_name, msg_id, sender_jid, sender_name, ts, from_me,
+                 text, display_text, quoted_msg_id, quoted_sender_jid, is_forwarded,
+                 forwarding_score, reaction_to_id, reaction_emoji, media_type,
+                 media_caption, filename, mime_type, file_length, local_path,
+                 downloaded_at, media_unavailable_at, revoked, deleted_for_me,
+                 edited, buttons
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "222@g.us", "Crew", "real1", "555@s.whatsapp.net", "Sam", 200, 0,
+                "hello crew", "hello crew", "", "", 0, 0, "", "", "", "", "", "", 0, "",
+                0, 0, 0, 0, 0, "",
+            ),
+        )
+        con.execute(
+            """INSERT INTO messages (
+                 chat_jid, chat_name, msg_id, sender_jid, sender_name, ts, from_me,
+                 text, display_text, quoted_msg_id, quoted_sender_jid, is_forwarded,
+                 forwarding_score, reaction_to_id, reaction_emoji, media_type,
+                 media_caption, filename, mime_type, file_length, local_path,
+                 downloaded_at, media_unavailable_at, revoked, deleted_for_me,
+                 edited, buttons
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "222@g.us", "Crew", "edit-stub", "555@s.whatsapp.net", "Sam", 210, 0,
+                "", "(message)", "", "", 0, 0, "", "", "", "", "", "", 0, "",
+                0, 0, 0, 0, 0, "",
+            ),
+        )
+        con.commit()
+        con.close()
+        messages = self.mod.list_messages(self.store, "222@g.us")
+        self.assertEqual([m["id"] for m in messages], ["real1"])
+        self.assertNotIn("Unsupported message", [m["text"] for m in messages])
+        chats = {c["jid"]: c for c in self.mod.list_chats(self.store)}
+        self.assertEqual(chats["222@g.us"]["preview"], "hello crew")
+
     def test_album_label_folds_photos_into_one_message(self):
         con = sqlite3.connect(self.db)
         con.execute(
@@ -320,6 +362,67 @@ class HelperTests(unittest.TestCase):
             self.mod.validate_mentions(self.store, "222@g.us", ["999@s.whatsapp.net"])
         got = self.mod.validate_mentions(self.store, "222@g.us", ["555@s.whatsapp.net"])
         self.assertEqual(got, ["555@s.whatsapp.net"])
+
+    def test_mentions_in_text_show_contact_name(self):
+        session = self.store / "session.db"
+        scon = sqlite3.connect(session)
+        scon.executescript(
+            "CREATE TABLE whatsmeow_lid_map (lid TEXT PRIMARY KEY, pn TEXT UNIQUE NOT NULL);"
+        )
+        scon.execute("INSERT INTO whatsmeow_lid_map VALUES ('148515808395375', '555')")
+        scon.commit()
+        scon.close()
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "UPDATE contacts SET phone = '55512345678' WHERE jid = '555@s.whatsapp.net'"
+        )
+        cols = """INSERT INTO messages (
+                     chat_jid, chat_name, msg_id, sender_jid, sender_name, ts, from_me,
+                     text, display_text, quoted_msg_id, quoted_sender_jid, is_forwarded,
+                     forwarding_score, reaction_to_id, reaction_emoji, media_type,
+                     media_caption, filename, mime_type, file_length, local_path,
+                     downloaded_at, media_unavailable_at, revoked, deleted_for_me,
+                     edited, buttons
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+        con.execute(
+            cols,
+            (
+                "222@g.us", "Crew", "men-lid", "111@s.whatsapp.net", "Denis", 210, 0,
+                "@148515808395375 haha", "@148515808395375 haha", "", "", 0,
+                0, "", "", "", "", "", "", 0, "", 0, 0, 0, 0, 0, "",
+            ),
+        )
+        con.execute(
+            cols,
+            (
+                "222@g.us", "Crew", "men-pn", "111@s.whatsapp.net", "Denis", 211, 0,
+                "@55512345678 also", "@55512345678 also", "men-lid", "", 0,
+                0, "", "", "", "", "", "", 0, "", 0, 0, 0, 0, 0, "",
+            ),
+        )
+        con.execute(
+            cols,
+            (
+                "222@g.us", "Crew", "men-unknown", "111@s.whatsapp.net", "Denis", 209, 0,
+                "@999999999 hello", "@999999999 hello", "", "", 0,
+                0, "", "", "", "", "", "", 0, "", 0, 0, 0, 0, 0, "",
+            ),
+        )
+        con.commit()
+        con.close()
+
+        self.assertEqual(
+            self.mod.apply_mention_names("@148515808395375 haha", {"148515808395375": "Sam Stone"}),
+            "@Sam Stone haha",
+        )
+        msgs = {m["id"]: m for m in self.mod.list_messages(self.store, "222@g.us")}
+        self.assertEqual(msgs["men-lid"]["text"], "@Sam Stone haha")
+        self.assertEqual(msgs["men-pn"]["text"], "@Sam Stone also")
+        self.assertEqual(msgs["men-pn"]["quotedText"], "@Sam Stone haha")
+        self.assertEqual(msgs["men-unknown"]["text"], "@999999999 hello")
+
+        chats = {c["jid"]: c for c in self.mod.list_chats(self.store)}
+        self.assertEqual(chats["222@g.us"]["preview"], "@Sam Stone also")
 
     def test_ack_and_badge(self):
         chats = self.mod.list_chats(self.store)
@@ -569,6 +672,12 @@ class HelperTests(unittest.TestCase):
             tweet["embedUrl"],
             "https://platform.twitter.com/embed/Tweet.html?id=266031293945503744&dnt=true&theme=dark",
         )
+        self.assertEqual(
+            self.mod.describe_link(
+                "https://x.com/TheCinesthetic/status/2096346129726345259/video/1?s=48"
+            )["embedUrl"],
+            "https://twitter.com/i/videos/tweet/2096346129726345259",
+        )
         self.assertEqual(self.mod.describe_link("https://example.com/x")["embedUrl"], "")
 
     def test_prune_media_drops_only_old_files(self):
@@ -656,6 +765,107 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(args[:2], ["send", "react"])
         self.assertEqual(args[args.index("--reaction") + 1], "")  # empty clears
         self.assertEqual(args[args.index("--sender") + 1], "555@s.whatsapp.net")
+
+    def test_group_reply_passes_quoted_sender(self):
+        calls = []
+        cols = """INSERT INTO messages (
+                 chat_jid, chat_name, msg_id, sender_jid, sender_name, ts, from_me,
+                 text, display_text, quoted_msg_id, quoted_sender_jid, is_forwarded,
+                 forwarding_score, reaction_to_id, reaction_emoji, media_type,
+                 media_caption, filename, mime_type, file_length, local_path,
+                 downloaded_at, media_unavailable_at, revoked, deleted_for_me,
+                 edited, buttons
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+
+        def fake_run(args, store=None, timeout=60, readonly=False, lock_wait="15s"):
+            calls.append(args)
+            if args[:2] == ["send", "text"] and args[args.index("--message") + 1] == "mach":
+                con = sqlite3.connect(self.db)
+                con.execute(
+                    cols,
+                    ("222@g.us", "Crew", "sent1", "", "me", 300, 1,
+                     "mach", "mach", "", "", 0, 0, "", "", "", "", "", "", 0, "",
+                     0, 0, 0, 0, 0, ""),
+                )
+                con.commit()
+                con.close()
+                return {"id": "sent1", "sent": True}
+            return {}
+
+        self.mod.run_wacli = fake_run
+        con = sqlite3.connect(self.db)
+        con.execute(
+            cols,
+            ("222@g.us", "Crew", "gm1", "555@s.whatsapp.net", "Sam", 80, 0,
+             "hi", "hi", "", "", 0, 0, "", "", "", "", "", "", 0, "",
+             0, 0, 0, 0, 0, ""),
+        )
+        con.commit()
+        con.close()
+        self.mod.send_text(self.store, "222@g.us", "mach", "gm1")
+        args = calls[-1]
+        self.assertEqual(args[:2], ["send", "text"])
+        self.assertEqual(args[args.index("--reply-to") + 1], "gm1")
+        self.assertEqual(args[args.index("--reply-to-sender") + 1], "555@s.whatsapp.net")
+        sent = next(m for m in self.mod.list_messages(self.store, "222@g.us") if m["id"] == "sent1")
+        self.assertEqual(sent["quotedId"], "gm1")
+        self.assertEqual(sent["quotedText"], "hi")
+        self.assertEqual(sent["quotedSender"], "Sam")
+
+        self.mod.send_text(self.store, "111@s.whatsapp.net", "ok", "m1")
+        dm = calls[-1]
+        self.assertEqual(dm[dm.index("--reply-to") + 1], "m1")
+        self.assertEqual(dm[dm.index("--reply-to-sender") + 1], "111@s.whatsapp.net")
+
+    def test_send_file_reply_passes_quoted_sender(self):
+        # A reply with a photo+caption must quote the original, same as text.
+        pic = self.tmp.name + "/pic.jpg"
+        Path(pic).write_bytes(b"\xff\xd8\xff")
+        calls = []
+        cols = """INSERT INTO messages (
+                 chat_jid, chat_name, msg_id, sender_jid, sender_name, ts, from_me,
+                 text, display_text, quoted_msg_id, quoted_sender_jid, is_forwarded,
+                 forwarding_score, reaction_to_id, reaction_emoji, media_type,
+                 media_caption, filename, mime_type, file_length, local_path,
+                 downloaded_at, media_unavailable_at, revoked, deleted_for_me,
+                 edited, buttons
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+
+        def fake_run(args, store=None, timeout=60, readonly=False, lock_wait="15s"):
+            calls.append(args)
+            if args[:2] == ["send", "file"]:
+                con = sqlite3.connect(self.db)
+                con.execute(
+                    cols,
+                    ("222@g.us", "Crew", "sent-pic", "", "me", 300, 1,
+                     "look", "look", "", "", 0, 0, "", "", "image", "look",
+                     "pic.jpg", "image/jpeg", 3, pic, 300, 0, 0, 0, 0, ""),
+                )
+                con.commit()
+                con.close()
+                return {"id": "sent-pic", "sent": True}
+            return {}
+
+        self.mod.run_wacli = fake_run
+        con = sqlite3.connect(self.db)
+        con.execute(
+            cols,
+            ("222@g.us", "Crew", "gm1", "555@s.whatsapp.net", "Sam", 80, 0,
+             "hi", "hi", "", "", 0, 0, "", "", "", "", "", "", 0, "",
+             0, 0, 0, 0, 0, ""),
+        )
+        con.commit()
+        con.close()
+        self.mod.send_file(self.store, "222@g.us", pic, "look", reply_to="gm1")
+        args = calls[-1]
+        self.assertEqual(args[:2], ["send", "file"])
+        self.assertEqual(args[args.index("--reply-to") + 1], "gm1")
+        self.assertEqual(args[args.index("--reply-to-sender") + 1], "555@s.whatsapp.net")
+        self.assertEqual(args[args.index("--caption") + 1], "look")
+        sent = next(m for m in self.mod.list_messages(self.store, "222@g.us") if m["id"] == "sent-pic")
+        self.assertEqual(sent["quotedId"], "gm1")
+        self.assertEqual(sent["quotedText"], "hi")
+        self.assertEqual(sent["quotedSender"], "Sam")
 
     def test_reaction_from_clipboard_rejects_junk(self):
         self.assertEqual(self.mod.reaction_from_clipboard("🔥\nmore"), "")

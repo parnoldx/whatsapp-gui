@@ -214,6 +214,8 @@ ApplicationWindow {
             return u + (u.indexOf("?") >= 0 ? "&" : "?") + "autoplay=1"
         if (u.indexOf("tiktok.com/embed/") !== -1 && u.indexOf("autoplay=") === -1)
             return u + (u.indexOf("?") >= 0 ? "&" : "?") + "autoplay=1"
+        if (u.indexOf("/i/videos/") !== -1 && u.indexOf("autoplay=") === -1)
+            return u + (u.indexOf("?") >= 0 ? "&" : "?") + "autoplay=1"
         if (u.indexOf("facebook.com/plugins/video.php") !== -1) {
             if (u.indexOf("autoplay=") === -1)
                 u += "&autoplay=true"
@@ -231,7 +233,29 @@ ApplicationWindow {
         return u.indexOf("/embed") !== -1
             || u.indexOf("plugins/video.php") !== -1
             || u.indexOf("Tweet.html") !== -1
+            || u.indexOf("/i/videos/") !== -1
             || u.indexOf("youtube.com/embed/") !== -1
+    }
+
+    function embedFrameOrigin(url) {
+        var u = String(url || "")
+        if (u.indexOf("instagram.com") !== -1)
+            return "https://www.instagram.com/"
+        if (u.indexOf("Tweet.html") !== -1 || u.indexOf("platform.twitter.com") !== -1)
+            return "https://platform.twitter.com/"
+        return ""
+    }
+
+    function embedFrameHtml(url) {
+        var src = String(url || "").replace(/&/g, "&amp;").replace(/"/g, "&quot;")
+        var fill = url.indexOf("instagram.com") !== -1
+        var style = fill
+            ? "html,body,iframe{margin:0;padding:0;width:100%;height:100%;border:0;background:#000;overflow:hidden}"
+            : "html,body{margin:0;width:100%;height:100%;background:#000;display:flex;align-items:center;justify-content:center;overflow:auto}"
+              + "iframe{width:min(550px,100%);height:100%;border:0;background:#000}"
+        return "<!DOCTYPE html><html><head><meta charset='utf-8'><style>" + style
+            + "</style></head><body><iframe src='" + src
+            + "' allow='autoplay; fullscreen; encrypted-media; picture-in-picture' allowfullscreen></iframe></body></html>"
     }
 
     function tiktokPrepScript() {
@@ -776,15 +800,9 @@ ApplicationWindow {
                                 var u = win.embedWatchUrl(win.viewer && win.viewer.embedUrl)
                                 if (!u)
                                     return
-                                if (u.indexOf("instagram.com") !== -1) {
-                                    var src = u.replace(/&/g, "&amp;").replace(/"/g, "&quot;")
-                                    loadHtml(
-                                        "<!DOCTYPE html><html><head><meta charset='utf-8'><style>"
-                                        + "html,body,iframe{margin:0;padding:0;width:100%;height:100%;border:0;background:#000;overflow:hidden}"
-                                        + "</style></head><body><iframe src='" + src
-                                        + "' allow='autoplay; fullscreen; encrypted-media; picture-in-picture' allowfullscreen></iframe></body></html>",
-                                        "https://www.instagram.com/"
-                                    )
+                                var origin = win.embedFrameOrigin(u)
+                                if (origin) {
+                                    loadHtml(win.embedFrameHtml(u), origin)
                                     return
                                 }
                                 url = u

@@ -853,13 +853,15 @@ void WhatsApp::sendText(const QString &text, const QVariantList &mentions, const
     call(args, QStringLiteral("sent"));
 }
 
-void WhatsApp::sendFile(const QString &path, const QString &caption) {
+void WhatsApp::sendFile(const QString &path, const QString &caption, const QString &replyId) {
     if (m_selectedJid.isEmpty())
         return;
     QStringList args{QStringLiteral("send-file"), QStringLiteral("--chat"), m_selectedJid,
                      QStringLiteral("--file"), path};
     if (!caption.isEmpty())
         args << QStringLiteral("--caption") << caption;
+    if (!replyId.isEmpty())
+        args << QStringLiteral("--reply-to") << replyId;
     m_sending = true;
     emit sendingChanged();
     updateActivity();

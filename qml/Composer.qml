@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Layouts
 import QtQuick.Controls as Controls
+import QtQuick.Window
 import "Model.js" as Model
 
 Item {
@@ -20,6 +21,11 @@ Item {
 
     implicitHeight: col.implicitHeight
     Layout.fillWidth: true
+    readonly property int maxInputHeight: {
+        var w = Window.window
+        var h = w ? w.height : 720
+        return Math.max(120, Math.min(360, Math.floor(h * 0.4)))
+    }
 
     function restore() {
         var draft = WhatsApp.draftFor(chatJid)
@@ -77,9 +83,10 @@ Item {
                 sent(Model.pendingMessage({
                     chatJid: chatJid, kind: Model.fileKind(f.name || f.path),
                     text: body, caption: body, filename: f.name || "",
-                    localPath: f.path || "", fileUrl: f.fileUrl || "", downloaded: true
+                    localPath: f.path || "", fileUrl: f.fileUrl || "", downloaded: true,
+                    quotedId: q.id, quotedSender: q.sender, quotedText: q.text
                 }))
-                WhatsApp.sendFile(f.path, body)
+                WhatsApp.sendFile(f.path, body, q.id)
             }
             clear()
             return
@@ -248,54 +255,64 @@ Item {
             AppButton {
                 text: "+"
                 iconOnly: true
+                Layout.alignment: Qt.AlignBottom
                 onClicked: root.pick()
             }
-            Controls.TextArea {
-                id: input
+            Controls.ScrollView {
+                id: inputScroll
                 Layout.fillWidth: true
-                Layout.preferredHeight: Math.max(36, Math.min(96, contentHeight + 12))
-                wrapMode: TextEdit.Wrap
-                color: Theme.textPrimary
-                font.family: Theme.fontFamily
-                font.pixelSize: 13
-                placeholderText: "Message"
-                background: Rectangle { radius: Theme.radiusSmall; color: Theme.cardBg }
-                onTextChanged: root.persist()
-                Keys.onPressed: function(event) {
-                    if (root.mentionOpen && (event.key === Qt.Key_Down || event.key === Qt.Key_Up)) {
-                        event.accepted = true
-                        var delta = event.key === Qt.Key_Down ? 1 : -1
-                        root.mentionIndex = (root.mentionIndex + delta + root.mentionMatches.length) % root.mentionMatches.length
-                        return
-                    }
-                    if (root.mentionOpen && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && !(event.modifiers & Qt.ShiftModifier)) {
-                        event.accepted = true
-                        root.chooseMention(root.mentionMatches[root.mentionIndex])
-                        return
-                    }
-                    if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && !(event.modifiers & Qt.ShiftModifier)) {
-                        event.accepted = true
-                        root.send()
-                        return
-                    }
-                    if (event.key === Qt.Key_V && (event.modifiers & Qt.ControlModifier) && (event.modifiers & Qt.ShiftModifier)) {
-                        event.accepted = true
-                        if (voice) voice.toggle()
-                        return
-                    }
-                    if (event.key === Qt.Key_V && (event.modifiers & Qt.ControlModifier)) {
-                        event.accepted = true
-                        root.pasteClipboard()
-                        return
-                    }
-                    if (event.key === Qt.Key_O && (event.modifiers & Qt.ControlModifier)) {
-                        event.accepted = true
-                        root.pick()
+                Layout.preferredHeight: Math.max(36, Math.min(root.maxInputHeight, input.implicitHeight))
+                Layout.maximumHeight: root.maxInputHeight
+                Layout.alignment: Qt.AlignBottom
+                clip: true
+                contentWidth: availableWidth
+                Controls.TextArea {
+                    id: input
+                    width: inputScroll.availableWidth
+                    wrapMode: TextEdit.Wrap
+                    color: Theme.textPrimary
+                    font.family: Theme.fontFamily
+                    font.pixelSize: 13
+                    placeholderText: "Message"
+                    background: Rectangle { radius: Theme.radiusSmall; color: Theme.cardBg }
+                    onTextChanged: root.persist()
+                    Keys.onPressed: function(event) {
+                        if (root.mentionOpen && (event.key === Qt.Key_Down || event.key === Qt.Key_Up)) {
+                            event.accepted = true
+                            var delta = event.key === Qt.Key_Down ? 1 : -1
+                            root.mentionIndex = (root.mentionIndex + delta + root.mentionMatches.length) % root.mentionMatches.length
+                            return
+                        }
+                        if (root.mentionOpen && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && !(event.modifiers & Qt.ShiftModifier)) {
+                            event.accepted = true
+                            root.chooseMention(root.mentionMatches[root.mentionIndex])
+                            return
+                        }
+                        if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && !(event.modifiers & Qt.ShiftModifier)) {
+                            event.accepted = true
+                            root.send()
+                            return
+                        }
+                        if (event.key === Qt.Key_V && (event.modifiers & Qt.ControlModifier) && (event.modifiers & Qt.ShiftModifier)) {
+                            event.accepted = true
+                            if (voice) voice.toggle()
+                            return
+                        }
+                        if (event.key === Qt.Key_V && (event.modifiers & Qt.ControlModifier)) {
+                            event.accepted = true
+                            root.pasteClipboard()
+                            return
+                        }
+                        if (event.key === Qt.Key_O && (event.modifiers & Qt.ControlModifier)) {
+                            event.accepted = true
+                            root.pick()
+                        }
                     }
                 }
             }
             AppButton {
                 iconOnly: true
+                Layout.alignment: Qt.AlignBottom
                 text: voice && voice.recording ? "\uF04D" : "\uF130"
                 kind: voice && voice.recording ? "primary" : "ghost"
                 onClicked: {
@@ -304,7 +321,12 @@ Item {
                     voice.toggle()
                 }
             }
-            AppButton { text: "Send"; kind: "primary"; onClicked: root.send() }
+            AppButton {
+                text: "Send"
+                kind: "primary"
+                Layout.alignment: Qt.AlignBottom
+                onClicked: root.send()
+            }
         }
     }
 }

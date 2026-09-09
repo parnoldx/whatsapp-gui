@@ -150,7 +150,7 @@ function threadStamp(messages) {
     var al = ""
     for (var a = 0; a < album.length; a++)
       al += (album[a] && album[a].downloaded) ? "d" : "-"
-    out.push(String(m.id || "") + "|" + (m.downloaded ? "d" : "") + "|" + rx + "|" + lp + "|" + al)
+    out.push(String(m.id || "") + "|" + (m.downloaded ? "d" : "") + "|" + rx + "|" + lp + "|" + al + "|" + String(m.quotedId || ""))
   }
   return out.join("\n")
 }
@@ -276,7 +276,10 @@ function embedUrlFor(host, url) {
   }
   if (h === "x.com" || h === "twitter.com") {
     m = path.match(/\/(?:i\/web\/)?status\/(\d+)/)
-    return m ? ("https://platform.twitter.com/embed/Tweet.html?id=" + m[1] + "&dnt=true&theme=dark") : ""
+    if (!m) return ""
+    if (path.indexOf("/video/") !== -1)
+      return "https://twitter.com/i/videos/tweet/" + m[1]
+    return "https://platform.twitter.com/embed/Tweet.html?id=" + m[1] + "&dnt=true&theme=dark"
   }
   if (h === "facebook.com" || h === "fb.watch") {
     if (h === "facebook.com" && /\/share\/[rv]\//.test(path))
@@ -294,7 +297,8 @@ function embedUrlFor(host, url) {
 
 function linkEmbed(preview) {
   if (!preview) return ""
-  var u = preview.embedUrl ? String(preview.embedUrl) : embedUrlFor(preview.host || "", preview.url || "")
+  var computed = embedUrlFor(preview.host || "", preview.url || "")
+  var u = computed || (preview.embedUrl ? String(preview.embedUrl) : "")
   if (u.indexOf("plugins/video.php") !== -1 && u.indexOf("%2Fshare%2F") !== -1)
     return ""
   return u.replace("/embed/v3/", "/embed/v2/")
@@ -466,7 +470,10 @@ function sameSend(real, pending) {
   if (String(real.chatJid || "") !== String(pending.chatJid || "")) return false
   if (String(real.kind || "text") !== String(pending.kind || "text")) return false
   if (Number(real.ts || 0) + 5 < Number(pending.ts || 0)) return false
-  if (String(real.quotedId || "") !== String(pending.quotedId || "")) return false
+  var realQuote = String(real.quotedId || "")
+  var pendingQuote = String(pending.quotedId || "")
+  // First post-send reload often has no quoted_msg_id yet.
+  if (realQuote && pendingQuote && realQuote !== pendingQuote) return false
   if (String(pending.kind || "text") === "text")
     return String(real.text || "") === String(pending.text || "")
   if (String(real.caption || "") !== String(pending.caption || "")) return false
@@ -475,10 +482,29 @@ function sameSend(real, pending) {
   return true
 }
 
+function copyMessage(m) {
+  var copy = {}
+  if (!m) return copy
+  for (var key in m) copy[key] = m[key]
+  return copy
+}
+
+function adoptQuote(real, pending) {
+  if (!real || !pending) return real
+  if (String(real.quotedText || "")) return real
+  if (!pending.quotedId && !pending.quotedText) return real
+  var copy = copyMessage(real)
+  if (!copy.quotedId) copy.quotedId = String(pending.quotedId || "")
+  if (!copy.quotedSender) copy.quotedSender = String(pending.quotedSender || "")
+  if (!copy.quotedText) copy.quotedText = String(pending.quotedText || "")
+  return copy
+}
+
 // Keep unacked outgoing bubbles across the post-send DB reload; drop each
-// when a matching from-me row shows up.
+// when a matching from-me row shows up. Carry the pending quote onto that
+// row when wacli stored the send without quoted_msg_id.
 function overlayPendingSends(messages, pending, selectedJid) {
-  var list = asList(messages)
+  var list = asList(messages).slice()
   var plist = asList(pending)
   if (!plist.length) return { messages: list, pending: [] }
   var have = {}
@@ -497,6 +523,10 @@ function overlayPendingSends(messages, pending, selectedJid) {
       if (sameSend(list[j], item)) {
         used[j] = true
         matched = true
+        var hadQuote = !!String((list[j] && list[j].quotedText) || "")
+        list[j] = adoptQuote(list[j], item)
+        if (!hadQuote && (item.quotedId || item.quotedText))
+          keep.push(item)
         break
       }
     }
