@@ -3,15 +3,29 @@
 Standalone Qt Quick WhatsApp client for Omarchy. It reads the local `wacli`
 mirror, sends through `wacli`, and follows `~/.local/state/omarchy/current/theme`.
 
-```bash
-cmake -B build -G Ninja
-cmake --build build
-cmake --install build --prefix ~/.local
-whatsapp-gui --toggle
+## Install (Omarchy)
+
+```sh
+sudo pacman -S --needed cmake ninja go qt6-base qt6-declarative qt6-multimedia qt6-webengine
+git clone <repo-url> && cd whatsapp-gui
+make install
 ```
 
-`Super+Shift+G` toggles the window. Closing hides it; the process stays so the
-next open is instant. `Ctrl+Q` quits.
+Installs to `~/.local` — `whatsapp-gui` and the bundled `wacli` helper. Run
+`whatsapp-gui --toggle` or bind it to a key. Closing hides the window; the
+process stays so the next open is instant. `Ctrl+Q` quits.
+
+## First run: pairing
+
+The GUI has no pairing screen — pair once with the wacli CLI:
+
+```sh
+brew install openclaw/tap/wacli   # or: go install -tags sqlite_fts5 github.com/openclaw/wacli/cmd/wacli@latest
+wacli auth                        # scan the terminal QR code: WhatsApp → Linked devices
+```
+
+After the first sync, launch `whatsapp-gui` — it finds the existing wacli
+store automatically and stays paired until you unlink the device in WhatsApp.
 
 ## Blade mode
 
@@ -34,3 +48,13 @@ Toggling hides and reshows the window, which remaps the surface, so Hyprland
 replays its `windowsIn`/`windowsOut` slide each time.
 
 `Esc` goes back to the chat list, or sheathes the blade when no chat is open.
+
+## Development
+
+```sh
+tests/run        # Go helper tests + QML model tests
+make install     # rebuild + reinstall to ~/.local
+```
+
+Vendored `wacli/` (trimmed to the helper and its internals) is MIT licensed by
+its upstream authors; the rest of this repo is MIT — see `LICENSE`.
