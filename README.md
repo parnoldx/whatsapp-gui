@@ -1,6 +1,4 @@
-<img src="site/assets/favicon.svg" width="30" align="left" alt="">
-
-# whatsapp-gui
+# <img src="site/assets/favicon.svg" width="30" align="left" alt=""> whatsapp-gui
 
 Standalone Qt Quick WhatsApp client for Omarchy. It reads the local `wacli`
 mirror, sends through `wacli`, and follows `~/.local/state/omarchy/current/theme`.
