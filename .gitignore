@@ -1,3 +1,5 @@
 build/
 wacli/cmd/whatsapp-helper/whatsapp
 wacli/whatsapp-helper
+wacli/cmd/whatsapp-helper/whatsapp-helper
+dist/

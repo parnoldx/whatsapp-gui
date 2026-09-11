@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en" data-theme="night">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>whatsapp-gui — Standalone Qt Quick WhatsApp client for Omarchy</title>
+    <meta
+      name="description"
+      content="Standalone Qt Quick WhatsApp client for Omarchy. Native right-edge blade window, inline social video playback for reels, offline SQLite mirror, and instant hotkey toggle."
+    />
+    <meta name="theme-color" content="#1a1b26" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="whatsapp-gui — Standalone Qt Quick WhatsApp client for Omarchy" />
+    <meta
+      property="og:description"
+      content="Native right-edge blade window, inline social video playback for reels, offline SQLite mirror, and instant hotkey toggle."
+    />
+    <meta property="og:site_name" content="whatsapp-gui" />
+    <meta property="og:url" content="https://parnoldx.github.io/whatsapp-gui/" />
+    <link rel="canonical" href="https://parnoldx.github.io/whatsapp-gui/" />
+    <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="assets/site.css" />
+    <script src="assets/site.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header">
+      <div class="container header-inner">
+        <a class="brand" href="index.html" aria-label="whatsapp-gui home">
+          <img class="brand-icon" src="assets/favicon.svg" alt="" width="28" height="28" />
+          <span>whatsapp-gui<span class="accent">.</span></span>
+        </a>
+        <nav class="site-nav" aria-label="Main navigation">
+          <a class="desktop-link" href="#features">Features</a>
+          <a href="#install">Install</a>
+          <a href="https://github.com/parnoldx/whatsapp-gui">GitHub <span aria-hidden="true">↗</span></a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main" tabindex="-1">
+      <div class="container">
+        <!-- Hero Section -->
+        <section class="hero" aria-labelledby="hero-title">
+          <div class="hero-grid">
+            <div>
+              <div class="eyebrow">
+                <span class="status-dot" aria-hidden="true"></span>Native Qt 6 · Right-Edge Blade · Omarchy
+              </div>
+              <h1 id="hero-title">
+                Instant blade.<br />Inline reels.<br /><span class="accent">Zero Electron.</span>
+              </h1>
+              <p class="hero-copy">
+                A native, standalone WhatsApp client engineered specifically for Omarchy and Hyprland.
+                Slides in as a 560px right-edge blade and plays Instagram Reels and social videos directly
+                inside the window without opening a browser.
+              </p>
+              <div class="hero-actions">
+                <a class="button" href="#install">Install whatsapp-gui <span aria-hidden="true">↗</span></a>
+              </div>
+              <div class="compat">
+                <span class="file-pill highlight">560px Edge Blade</span>
+                <span class="file-pill purple-pill">Inline Social Reels</span>
+                <span class="file-pill cyan-pill">Local SQLite Mirror</span>
+              </div>
+              <p class="small-note">Free &amp; open source · Omarchy · MIT License</p>
+            </div>
+
+            <!-- Authentic Blade GUI Preview (Only the Blade Chat) -->
+            <div class="preview-blade-container">
+              <div class="app-blade-frame" id="bladeFrame">
+                <!-- Blade Header matching qml/Main.qml -->
+                <div class="blade-header">
+                  <button type="button" class="qml-btn" aria-label="Back to chat list">Back</button>
+                  <div class="blade-avatar">AR</div>
+                  <div class="blade-contact-meta">
+                    <span class="blade-contact-name">Alex Rivera</span>
+                    <span class="blade-contact-status">online</span>
+                  </div>
+                  <button type="button" class="qml-btn icon-only" aria-label="Search chat">🔍</button>
+                </div>
+
+                <!-- Blade Messages Thread -->
+                <div class="blade-messages">
+                  <!-- Inbound Text -->
+                  <div class="bubble in">
+                    Check out this reel! You can play it right inside the blade now:
+                    <div class="bubble-meta"><span>14:28</span></div>
+                  </div>
+
+                  <!-- Inline Social Reel Preview Card -->
+                  <div class="bubble in" style="max-width: 90%; padding: 6px;">
+                    <div class="social-preview-card" id="mockReelCard" title="Click to test inline player">
+                      <div class="social-preview-thumb">
+                        <span class="social-tag-badge">REEL · INSTAGRAM</span>
+                        <div class="social-play-trigger" aria-hidden="true">▶</div>
+                      </div>
+                      <div class="social-preview-info">
+                        <span class="social-site-title">Instagram Reel</span>
+                        <span class="social-caption">Behind the scenes: Custom Wayland compositing &amp; edge blade layouts</span>
+                        <span class="social-host">instagram.com</span>
+                      </div>
+                    </div>
+                    <div class="bubble-meta">
+                      <span class="purple" style="font-size: 10.5px;">✦ Click card to watch inline</span>
+                      <span>14:29</span>
+                    </div>
+                  </div>
+
+                  <!-- Outbound with Quoted Reply & Checkmarks -->
+                  <div class="bubble out">
+                    <div class="bubble-quote">
+                      <div class="bubble-quote-author">Alex Rivera</div>
+                      Check out this reel! You can play it right inside the blade now...
+                    </div>
+                    Smooth! No external browser tabs opening up anymore.
+                    <div class="bubble-meta">
+                      <span>14:30</span>
+                      <span class="cyan">✓✓</span>
+                    </div>
+                    <div class="reactions-pill">
+                      <span>👍 2</span>
+                      <span>🔥 1</span>
+                    </div>
+                  </div>
+
+                  <!-- Inbound Voice Note with Waveform -->
+                  <div class="bubble in">
+                    <div class="bubble-audio">
+                      <button id="audioPlayBtn" class="audio-btn" type="button" aria-label="Play sample voice note">▶</button>
+                      <div class="audio-waves" aria-hidden="true">
+                        <span class="wave-bar" style="height: 6px;"></span>
+                        <span class="wave-bar" style="height: 14px;"></span>
+                        <span class="wave-bar" style="height: 20px;"></span>
+                        <span class="wave-bar" style="height: 16px;"></span>
+                        <span class="wave-bar" style="height: 8px;"></span>
+                        <span class="wave-bar" style="height: 18px;"></span>
+                        <span class="wave-bar dim" style="height: 12px;"></span>
+                        <span class="wave-bar dim" style="height: 16px;"></span>
+                        <span class="wave-bar dim" style="height: 8px;"></span>
+                        <span class="wave-bar dim" style="height: 12px;"></span>
+                      </div>
+                      <span id="audioDuration" style="font-size: 10px; color: var(--muted);">0:42</span>
+                    </div>
+                    <div class="bubble-meta"><span>14:31</span></div>
+                  </div>
+                </div>
+
+                <!-- In-Window Video Player Overlay (Shown when user clicks social reel) -->
+                <div class="inwindow-player-overlay" id="mockInWindowPlayer" hidden>
+                  <div class="inwindow-header">
+                    <span style="font-size: 12px; font-weight: 700; color: #fff;">Instagram Reel</span>
+                    <div style="display: flex; gap: 8px;">
+                      <button type="button" class="qml-btn" style="font-size: 11px;">Open externally</button>
+                      <button id="mockClosePlayerBtn" type="button" class="qml-btn active" style="font-size: 11px;">Close (Esc)</button>
+                    </div>
+                  </div>
+                  <div class="inwindow-video-canvas">
+                    <span class="video-playing-indicator">● Inline WebEngine Active</span>
+                    <div style="text-align: center; padding: 20px;">
+                      <div style="font-size: 32px; margin-bottom: 8px;">🎬</div>
+                      <div style="font-weight: 700; color: #fff; font-size: 14px; margin-bottom: 4px;">Playing directly inside the blade</div>
+                      <div style="font-size: 11.5px; color: var(--muted);">No external browser launched · Hit Esc to sheathe player</div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Blade Composer matching qml/Composer.qml -->
+                <div class="blade-composer">
+                  <button type="button" class="qml-btn icon-only" aria-label="Add attachment">+</button>
+                  <input class="blade-input" type="text" placeholder="Message Alex Rivera" aria-label="Type a message" value="The in-window reel viewer is so convenient!" readonly />
+                  <button type="button" class="qml-btn icon-only" aria-label="Record voice note">🎙</button>
+                  <button type="button" class="qml-btn active" aria-label="Send message">Send</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Installation Section -->
+        <section id="install" aria-labelledby="install-title">
+          <div class="section-header">
+            <span class="section-tag">Installation</span>
+            <h2 id="install-title">Install from Source</h2>
+            <p class="section-lead">
+              Clone the repository, install system dependencies with pacman, and build cleanly into <code class="inline-code">~/.local</code>.
+            </p>
+          </div>
+
+          <div class="step-list">
+            <!-- Step 1: Clone & Build -->
+            <div class="step-item">
+              <div class="step-number" aria-hidden="true">1</div>
+              <div class="step-content">
+                <h3>Build &amp; Install</h3>
+                <p>
+                  Installs <code class="inline-code">whatsapp-gui</code> and the bundled <code class="inline-code">wacli</code> CLI to <code class="inline-code">~/.local/bin</code>:
+                </p>
+                <div class="terminal">
+                  <div class="terminal-header">
+                    <span>Terminal</span>
+                    <button class="copy-btn" type="button" data-copy="cmd-install" hidden>Copy</button>
+                  </div>
+                  <pre><code id="cmd-install">git clone https://github.com/parnoldx/whatsapp-gui.git && cd whatsapp-gui
+make dependencies   # once: install deps via pacman
+make install</code></pre>
+                </div>
+              </div>
+            </div>
+
+            <!-- Step 2: First-run pairing -->
+            <div class="step-item">
+              <div class="step-number" aria-hidden="true">2</div>
+              <div class="step-content">
+                <h3>First Run: Pairing</h3>
+                <p>
+                  The GUI has no pairing screen — pair once with the bundled <code class="inline-code">wacli</code> CLI (installed to <code class="inline-code">~/.local/bin</code> by <code class="inline-code">make install</code>):
+                </p>
+                <div class="terminal">
+                  <div class="terminal-header">
+                    <span>Terminal</span>
+                    <button class="copy-btn" type="button" data-copy="cmd-pair" hidden>Copy</button>
+                  </div>
+                  <pre><code id="cmd-pair">wacli auth</code></pre>
+                </div>
+                <p class="small-note">
+                  Scan the terminal QR code in WhatsApp on your phone: <strong>Settings → Linked devices → Link a device</strong>.
+                  After the first sync, launch <code class="inline-code">whatsapp-gui --toggle</code> — it finds the local wacli store automatically and stays paired permanently.
+                </p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Social Inline Video Player Section -->
+        <section id="social-inline" aria-labelledby="social-title">
+          <div class="section-header">
+            <span class="section-tag">Inline Media</span>
+            <h2 id="social-title">Watch Social Videos &amp; Reels Directly in the Window</h2>
+            <p class="section-lead">
+              When friends send Instagram Reels or media links, you shouldn't have to break your focus and launch a heavyweight desktop browser.
+              whatsapp-gui plays social videos right inside the chat window.
+            </p>
+          </div>
+
+          <div class="features-grid">
+            <div class="feature-card highlight">
+              <div class="feature-icon purple-icon">🎬</div>
+              <h3>Embedded In-Window Player</h3>
+              <p>
+                A specialized, hardware-accelerated Qt WebEngine overlay renders Instagram Reels and social video embeds directly inside the blade.
+                Audio and video play instantly with full autoplay support.
+              </p>
+            </div>
+
+            <div class="feature-card">
+              <div class="feature-icon">⚡</div>
+              <h3>Zero Browser Context Switching</h3>
+              <p>
+                Keep chatting without opening browser windows, managing unwanted tabs, or cluttering your daily browsing session with one-off video links.
+              </p>
+            </div>
+
+            <div class="feature-card">
+              <div class="feature-icon">⌨️</div>
+              <h3>Instant Esc Dismissal</h3>
+              <p>
+                Done watching? Hit <kbd>Esc</kbd> or click <strong>Close</strong> to immediately sheathe the player overlay and return seamlessly to your conversation.
+                An <strong>Open externally</strong> button remains available whenever you need the full web page.
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <!-- Blade Mode Section -->
+        <section id="blade-mode" aria-labelledby="blade-title">
+          <div class="section-header">
+            <span class="section-tag">Hyprland Integration</span>
+            <h2 id="blade-title">Right-Edge Blade Window</h2>
+            <p class="section-lead">
+              whatsapp-gui is dimensioned as a 560px right-edge blade. Hyprland handles window movement, floating,
+              and slide animations via your desktop configuration.
+            </p>
+          </div>
+
+          <div class="step-content">
+            <p>
+              Add these rules to <code class="inline-code">~/.config/hypr/looknfeel.lua</code>:
+            </p>
+
+            <div class="terminal">
+              <div class="terminal-header">
+                <span>~/.config/hypr/looknfeel.lua</span>
+                <button class="copy-btn" type="button" data-copy="code-hyprland" hidden>Copy</button>
+              </div>
+              <pre><code id="code-hyprland">o.window("^(whatsapp-gui)$", { name = "blade-whatsapp", float = true })
+o.window("^(whatsapp-gui)$", { size = { 560, "monitor_h - 26" } })
+o.window("^(whatsapp-gui)$", { move = { "monitor_w - 560", 26 } })
+o.window("^(whatsapp-gui)$", { animation = "slide right" })
+o.window("^(whatsapp-gui)$", { rounding = 0 })</code></pre>
+            </div>
+
+            <p>
+              Bind your preferred toggle hotkey in your Hyprland configuration (e.g. <kbd>Super</kbd> + <kbd>M</kbd>):
+            </p>
+
+            <div class="terminal">
+              <div class="terminal-header">
+                <span>~/.config/hypr/hyprland.conf</span>
+                <button class="copy-btn" type="button" data-copy="code-bind" hidden>Copy</button>
+              </div>
+              <pre><code id="code-bind">bind = $mainMod, M, exec, whatsapp-gui --toggle</code></pre>
+            </div>
+
+            <div class="features-grid" style="margin-top: 32px;">
+              <div class="feature-card">
+                <div class="feature-icon">⚡</div>
+                <h3>Memory Resident &amp; Instant Wake</h3>
+                <p>
+                  Closing or toggling the window simply hides the surface while keeping the process warm in memory.
+                  Triggering the toggle hotkey brings it back into view in under 10ms.
+                </p>
+              </div>
+
+              <div class="feature-card">
+                <div class="feature-icon">🗡️</div>
+                <h3>Hierarchical Esc Behavior</h3>
+                <p>
+                  Pressing <kbd>Esc</kbd> when watching a video closes the video overlay. Pressing <kbd>Esc</kbd> in a chat returns to the conversation list.
+                  Pressing <kbd>Esc</kbd> from the chat list sheathes the blade.
+                </p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Features Section -->
+        <section id="features" aria-labelledby="features-title">
+          <div class="section-header">
+            <span class="section-tag">Capabilities</span>
+            <h2 id="features-title">Native WhatsApp Features</h2>
+            <p class="section-lead">
+              A comprehensive messaging experience designed for speed, privacy, and full keyboard control.
+            </p>
+          </div>
+
+          <div class="features-grid">
+            <div class="feature-card">
+              <div class="feature-icon">🎙️</div>
+              <h3>Voice Notes &amp; Audio Recording</h3>
+              <p>
+                Record voice messages with the built-in microphone tool. Audio playback includes position indicators,
+                simulated waveform bars, and clear playback timing.
+              </p>
+            </div>
+
+            <div class="feature-card">
+              <div class="feature-icon">🖼️</div>
+              <h3>Albums &amp; Image Galleries</h3>
+              <p>
+                Multi-image photo bursts collapse into compact grid tiles so they don't consume your entire thread height.
+                Clicking opens the high-resolution media viewer.
+              </p>
+            </div>
+
+            <div class="feature-card">
+              <div class="feature-icon">💬</div>
+              <h3>Replies &amp; Reactions</h3>
+              <p>
+                Quote-reply to any incoming or outgoing message. Add, toggle, and view emoji reaction counters
+                with instant local optimism.
+              </p>
+            </div>
+
+            <div class="feature-card">
+              <div class="feature-icon">💾</div>
+              <h3>Offline SQLite Mirror</h3>
+              <p>
+                All messages, contacts, and metadata are mirrored into a local SQLite database by wacli.
+                Search and browse your message history instantaneously, even while offline.
+              </p>
+            </div>
+
+            <div class="feature-card">
+              <div class="feature-icon">✓</div>
+              <h3>Unread Counter &amp; Mark Read</h3>
+              <p>
+                Mute-aware unread badges keep your chat list organized. Click the mark-all-read checkmark (<code class="inline-code">✓</code>)
+                to clear badges across all active chats at once.
+              </p>
+            </div>
+
+            <div class="feature-card">
+              <div class="feature-icon">🔗</div>
+              <h3>CLI Chat Deep-Linking</h3>
+              <p>
+                Open any chat directly from your application launcher, scripts, or rofi with
+                <code class="inline-code">whatsapp-gui --chat &lt;jid&gt;</code>.
+              </p>
+            </div>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div class="container footer-inner">
+        <div>
+          <strong>whatsapp-gui<span class="accent">.</span></strong>
+          <span> — Crafted for Omarchy. MIT License.</span>
+        </div>
+        <div class="footer-links">
+          <a href="#main">Back to top ↑</a>
+          <a href="#features">Features</a>
+          <a href="#install">Install</a>
+          <a href="https://github.com/parnoldx/whatsapp-gui">GitHub</a>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>

@@ -1,13 +1,19 @@
+<img src="site/assets/favicon.svg" width="30" align="left" alt="">
+
 # whatsapp-gui
 
 Standalone Qt Quick WhatsApp client for Omarchy. It reads the local `wacli`
 mirror, sends through `wacli`, and follows `~/.local/state/omarchy/current/theme`.
 
-## Install (Omarchy)
+&nbsp;
+
+**Website & Documentation:** [https://parnoldx.github.io/whatsapp-gui/](https://parnoldx.github.io/whatsapp-gui/)
+
+## Install (from source)
 
 ```sh
-sudo pacman -S --needed cmake ninja go qt6-base qt6-declarative qt6-multimedia qt6-webengine
-git clone <repo-url> && cd whatsapp-gui
+git clone https://github.com/parnoldx/whatsapp-gui && cd whatsapp-gui
+make dependencies   # once: build deps via pacman
 make install
 ```
 
@@ -17,10 +23,10 @@ process stays so the next open is instant. `Ctrl+Q` quits.
 
 ## First run: pairing
 
-The GUI has no pairing screen — pair once with the wacli CLI:
+The GUI has no pairing screen — pair once with the bundled `wacli` CLI
+(installed to `~/.local/bin` by `make install`):
 
 ```sh
-brew install openclaw/tap/wacli   # or: go install -tags sqlite_fts5 github.com/openclaw/wacli/cmd/wacli@latest
 wacli auth                        # scan the terminal QR code: WhatsApp → Linked devices
 ```
 
