@@ -136,6 +136,38 @@ function messageHasId(m, id) {
   return false
 }
 
+function chatByJid(chats, jid) {
+  var list = asList(chats)
+  for (var i = 0; i < list.length; i++) {
+    if (list[i] && String(list[i].jid || "") === String(jid || "")) return list[i]
+  }
+  return null
+}
+
+function indexOfId(messages, id) {
+  var list = asList(messages)
+  for (var i = 0; i < list.length; i++) {
+    if (messageHasId(list[i], id)) return i
+  }
+  return -1
+}
+
+// Where reading should resume: the first message newer than the last local ack.
+// Without an ack (chat never opened here) fall back to WhatsApp's unread count.
+function firstUnreadIndex(messages, unread, ack) {
+  var list = asList(messages)
+  if (!list.length) return -1
+  var a = Number(ack || 0)
+  if (a > 0) {
+    for (var i = 0; i < list.length; i++) {
+      if (Number((list[i] && list[i].ts) || 0) > a) return i
+    }
+    return -1
+  }
+  var n = Number(unread || 0)
+  return (n > 0 && n < list.length) ? list.length - n : -1
+}
+
 // Like messageIds, but also folds in the fields that get patched in place on an
 // otherwise-unchanged thread (download state, link-preview fetch, reactions), so
 // the view re-adopts when one of those flips instead of showing stale data.
@@ -554,6 +586,9 @@ if (typeof module !== "undefined" && module.exports) {
     adoptThread: adoptThread,
     messageIds: messageIds,
     messageHasId: messageHasId,
+    chatByJid: chatByJid,
+    indexOfId: indexOfId,
+    firstUnreadIndex: firstUnreadIndex,
     threadStamp: threadStamp,
     applyMyReaction: applyMyReaction,
     overlayMyReactions: overlayMyReactions,

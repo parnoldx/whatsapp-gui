@@ -17,6 +17,7 @@ Item {
     signal openLink(var preview, bool external)
 
     property bool highlighted: false
+    property bool unreadMark: false
     property bool reactOpen: false
     readonly property string messageId: (message && message.id) ? message.id : ""
     onMessageIdChanged: reactOpen = false
@@ -53,7 +54,7 @@ Item {
     readonly property string embedUrl: Model.linkEmbed(preview)
     readonly property var palette: Theme.avatarPalette
 
-    implicitHeight: col.implicitHeight
+    implicitHeight: col.implicitHeight + mark.height
     readonly property string previewUrl: preview && preview.url ? preview.url : ""
 
     onPreviewUrlChanged: {
@@ -66,8 +67,43 @@ Item {
             WhatsApp.fetchLinkPreview(previewUrl)
     }
 
+    // Where reading resumes: the first message that was unread on entering.
+    Item {
+        id: mark
+        visible: root.unreadMark
+        width: parent.width
+        height: visible ? 22 : 0
+        Rectangle {
+            anchors.verticalCenter: parent.verticalCenter
+            width: parent.width
+            height: 1
+            color: Theme.accent
+            opacity: 0.5
+        }
+        Rectangle {
+            anchors.centerIn: parent
+            width: markLabel.implicitWidth + 14
+            height: 18
+            radius: 9
+            color: Theme.windowBg
+            border.color: Theme.accent
+            border.width: 1
+            Text {
+                id: markLabel
+                anchors.centerIn: parent
+                text: "Unread"
+                textFormat: Text.PlainText
+                color: Theme.accent
+                font.family: Theme.fontFamily
+                font.pixelSize: 10
+                font.bold: true
+            }
+        }
+    }
+
     Column {
         id: col
+        y: mark.height
         anchors.left: fromMe ? undefined : parent.left
         anchors.right: fromMe ? parent.right : undefined
         spacing: 4
@@ -346,6 +382,13 @@ Item {
                     onLinkActivated: function(link) {
                         var parsed = Model.parseLink(link)
                         root.openLink(parsed && parsed.url ? parsed : { url: link }, false)
+                    }
+                    // Poll votes carry the poll they belong to: tap to jump to it.
+                    MouseArea {
+                        anchors.fill: parent
+                        enabled: !!(message && message.pollId)
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.jumpTo(message.pollId)
                     }
                 }
 

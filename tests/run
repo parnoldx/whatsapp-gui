@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-python3 -B -m unittest discover -s "$root/tests" -p 'test_*.py'
+(cd "$root/wacli" && go test -tags sqlite_fts5 -timeout 300s ./cmd/whatsapp-helper)
 node --test "$root/tests/model.test.js"

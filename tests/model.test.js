@@ -284,3 +284,14 @@ test("mentionToken finds @query at the cursor", () => {
   const applied = Model.applyMention("hi @sa", 6, "Sam Stone")
   assert.equal(applied.text, "hi @Sam Stone ")
 })
+
+test("firstUnreadIndex resumes at the first message past the ack", () => {
+  const msgs = [{ id: "a", ts: 10 }, { id: "b", ts: 20 }, { id: "c", ts: 30 }]
+  assert.equal(Model.firstUnreadIndex(msgs, 2, 10), 1)
+  assert.equal(Model.firstUnreadIndex(msgs, 0, 30), -1)
+  assert.equal(Model.firstUnreadIndex([], 2, 10), -1)
+  // no ack yet: fall back to the server-side unread count
+  assert.equal(Model.firstUnreadIndex(msgs, 2, 0), 1)
+  assert.equal(Model.firstUnreadIndex(msgs, 0, 0), -1)
+  assert.equal(Model.indexOfId(msgs, "c"), 2)
+})

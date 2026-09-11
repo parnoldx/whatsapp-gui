@@ -1,2 +1,5 @@
 build/
-__pycache__/
+wacli/cmd/whatsapp-helper/whatsapp
+tests/__pycache__/
+wacli/whatsapp-helper
+helper/__pycache__/

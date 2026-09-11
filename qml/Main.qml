@@ -31,6 +31,11 @@ ApplicationWindow {
     property var pendingSends: []
     property var pendingReactMsg: null
     property string highlightId: ""
+    property bool unreadPending: false
+    property real unreadAck: 0
+    property int unreadCount: 0
+    property string unreadId: ""
+    property string unreadMarkId: ""
     readonly property var chats: Model.filterChats(WhatsApp.chats, query)
     readonly property var chat: WhatsApp.selectedChat
     readonly property var threadMessages: shownMessages
@@ -82,6 +87,7 @@ ApplicationWindow {
     function queueSend(msg) {
         if (!msg || !msg.chatJid)
             return
+        win.dropUnreadAnchor()
         win.stickToEnd = true
         var next = (win.pendingSends || []).slice()
         next.push(msg)
@@ -145,11 +151,44 @@ ApplicationWindow {
         anchorY = thread.contentY
     }
 
+    function dropUnreadAnchor() {
+        win.unreadPending = false
+        win.unreadId = ""
+    }
+
+    // Entering a chat with unread messages starts at the first one instead of
+    // the very bottom, and keeps it pinned while the thread reloads.
+    function anchorUnread() {
+        if (!thread.count || (!win.unreadPending && !win.unreadId))
+            return false
+        var idx = win.unreadId ? Model.indexOfId(win.shownMessages, win.unreadId) : -1
+        if (idx < 0 && win.unreadPending) {
+            idx = Model.firstUnreadIndex(win.shownMessages, win.unreadCount, win.unreadAck)
+            if (idx >= 0) {
+                win.unreadPending = false
+                win.unreadId = String((win.shownMessages[idx] && win.shownMessages[idx].id) || "")
+                win.unreadMarkId = win.unreadId
+            }
+        }
+        if (idx < 0)
+            return false
+        thread.cancelFlick()
+        win.stickToEnd = false
+        win.pinning = true
+        thread.positionViewAtIndex(idx, ListView.Beginning)
+        win.anchorY = thread.contentY
+        restoreTimer.tries = 0
+        restoreTimer.restart()
+        return true
+    }
+
     function restoreAnchor() {
         if (shownJid !== WhatsApp.selectedJid) {
             win.pinning = false
             return
         }
+        if (win.anchorUnread())
+            return
         if (stickToEnd) {
             win.goToNewest()
             return
@@ -169,12 +208,24 @@ ApplicationWindow {
         property int tries: 0
         onTriggered: {
             tries += 1
-            if (tries > 15 || thread.moving) {
+            if (thread.moving) { // the user took over: stop fighting them
+                stop()
+                win.pinning = false
+                win.dropUnreadAnchor()
+                return
+            }
+            // async image heights settle slowly in media-heavy threads, so hold
+            // the unread anchor longer than a plain scroll-position restore
+            if (tries > (win.unreadId ? 45 : 15)) {
                 stop()
                 win.pinning = false
                 return
             }
-            thread.contentY = win.anchorY
+            var idx = win.unreadId ? Model.indexOfId(win.shownMessages, win.unreadId) : -1
+            if (idx >= 0)
+                thread.positionViewAtIndex(idx, ListView.Beginning)
+            else
+                thread.contentY = win.anchorY
         }
     }
 
@@ -378,6 +429,7 @@ ApplicationWindow {
 
     function focusMessage(id) {
         win.stickToEnd = false
+        win.dropUnreadAnchor()
         for (var i = 0; i < thread.count; i++) {
             if (Model.messageHasId(thread.model[i], id)) {
                 thread.positionViewAtIndex(i, ListView.Contain)
@@ -413,7 +465,7 @@ ApplicationWindow {
     Shortcut {
         sequences: ["Ctrl+E"]
         enabled: !!win.chat
-        onActivated: win.goToNewest()
+        onActivated: { win.dropUnreadAnchor(); win.goToNewest() }
     }
 
     Shortcut {
@@ -440,6 +492,15 @@ ApplicationWindow {
     Connections {
         target: WhatsApp
         function onSelectedJidChanged() {
+            // Runs before the C++ side acks the chat, so acks still hold the
+            // timestamp we last read up to.
+            var chat = Model.chatByJid(WhatsApp.chats, WhatsApp.selectedJid)
+            win.unreadAck = Number((WhatsApp.acks && WhatsApp.acks[WhatsApp.selectedJid]) || 0)
+            win.unreadCount = chat ? Number(chat.unreadCount || 0) : 0
+            win.unreadPending = !!chat && win.unreadCount > 0
+                && Number(chat.lastMessageTs || 0) > win.unreadAck
+            win.unreadId = ""
+            win.unreadMarkId = ""
             win.stickToEnd = true
             win.anchorY = 0
             win.shownMessages = []
@@ -499,9 +560,19 @@ ApplicationWindow {
                     anchors.fill: parent
                     anchors.margins: 10
                     spacing: 8
-                    ControlsSearch {
-                        id: search
+                    RowLayout {
                         Layout.fillWidth: true
+                        spacing: 6
+                        ControlsSearch {
+                            id: search
+                            Layout.fillWidth: true
+                        }
+                        AppButton {
+                            text: "\u2713"
+                            iconOnly: true
+                            active: WhatsApp.unreadBadge > 0
+                            onClicked: WhatsApp.markAllRead()
+                        }
                     }
                     Text {
                         visible: win.chats.length === 0
@@ -642,6 +713,7 @@ ApplicationWindow {
                             spacing: 8
                             reuseItems: true
                             model: win.threadMessages
+                            onMovementStarted: if (!win.pinning) win.dropUnreadAnchor()
                             onMovementEnded: {
                                 restoreTimer.stop()
                                 win.pinning = false
@@ -673,6 +745,7 @@ ApplicationWindow {
                                 onJumpTo: function(id) { win.focusMessage(id) }
                                 onOpenLink: function(preview, external) { win.openLink(preview, external) }
                                 highlighted: Model.messageHasId(modelData, win.highlightId)
+                                unreadMark: !!win.unreadMarkId && Model.messageHasId(modelData, win.unreadMarkId)
                             }
                         }
                         Text {
@@ -706,7 +779,7 @@ ApplicationWindow {
                                 font.pixelSize: 16
                             }
                             HoverHandler { id: jumpHover; cursorShape: Qt.PointingHandCursor }
-                            TapHandler { onTapped: win.goToNewest() }
+                            TapHandler { onTapped: { win.dropUnreadAnchor(); win.goToNewest() } }
                         }
                     }
                     Text {

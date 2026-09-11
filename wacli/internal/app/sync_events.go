@@ -1,0 +1,843 @@
+package app
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"os"
+	"runtime/debug"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/openclaw/wacli/internal/store"
+	"github.com/openclaw/wacli/internal/wa"
+	"go.mau.fi/whatsmeow/appstate"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
+)
+
+// loggedOutRecoveryHint is the operator-facing recovery sequence for a revoked
+// session. sync deliberately keeps the local device record (see the LoggedOut
+// case), and `auth --phone` short-circuits while that record exists — so
+// re-pairing needs the explicit local logout first.
+const loggedOutRecoveryHint = "To re-authenticate, run `wacli auth logout` to clear the local session, then `wacli auth --phone` to pair again."
+
+func newMediaEnqueuer(ctx context.Context, queue *mediaQueue) func(chatJID, msgID string) {
+	return func(chatJID, msgID string) {
+		if strings.TrimSpace(chatJID) == "" || strings.TrimSpace(msgID) == "" {
+			return
+		}
+		queue.enqueue(ctx, mediaJob{chatJID: chatJID, msgID: msgID})
+	}
+}
+
+type staleReconnectRequest struct {
+	threshold   time.Duration
+	idle        time.Duration
+	errorCount  int
+	lastSuccess time.Time
+	source      string
+}
+
+// syncPresence serializes available presence sends with the final
+// unavailable cleanup so an in-flight Connected or PushNameSetting
+// callback cannot mark the device available after the cleanup send.
+type syncPresence struct {
+	mu             sync.Mutex
+	cleanupStarted bool
+}
+
+func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, messagesStored, lastEvent *atomic.Int64, disconnected chan<- struct{}, loggedOut chan<- struct{}, staleReconnect chan<- staleReconnectRequest, enqueueMedia func(string, string), enqueueWebhook func(syncWebhookEvent), limits *syncStorageLimits, ps *syncPresence, mediaQ *mediaQueue) uint32 {
+	var panicCount atomic.Int64
+	var appStateRecoveries sync.Map
+	if enqueueWebhook == nil {
+		enqueueWebhook = func(syncWebhookEvent) {}
+	}
+	enqueueWebhookMessage := newSyncWebhookMessageEnqueuer(enqueueWebhook)
+	if !opts.WebhookEvents.Enabled(SyncWebhookEventMessage) {
+		enqueueWebhookMessage = func(wa.ParsedMessage) {}
+	}
+	return a.wa.AddEventHandler(func(evt interface{}) {
+		if mediaQ != nil {
+			if !mediaQ.beginProducer() {
+				return
+			}
+			defer mediaQ.endProducer()
+		}
+		if opts.Mode == SyncModeFollow && syncActivityEvent(evt) {
+			a.writeHeartbeat()
+		}
+
+		// Recover from panics so unexpected message structures do not crash the
+		// process. Include event type, stack trace, and a running counter.
+		defer func() {
+			if r := recover(); r != nil {
+				n := panicCount.Add(1)
+				if a.eventsEnabled() {
+					a.emitEvent("event_handler_panic", map[string]any{
+						"total": n,
+						"event": fmt.Sprintf("%T", evt),
+						"panic": fmt.Sprint(r),
+						"stack": string(debug.Stack()),
+					})
+				} else {
+					fmt.Fprintf(os.Stderr, "\nevent handler panic (recovered, total=%d) event=%T: %v\n%s\n",
+						n, evt, r, debug.Stack())
+				}
+			}
+		}()
+		switch v := evt.(type) {
+		case *events.Message:
+			lastEvent.Store(nowUTC().UnixNano())
+			if notif := historySyncNotificationFromMessage(v); notif != nil {
+				if notif.GetSyncType() == waE2E.HistorySyncType_ON_DEMAND {
+					return
+				}
+				a.downloadAndHandleHistorySync(ctx, opts, notif, messagesStored, lastEvent, enqueueMedia, limits)
+				return
+			}
+			a.handleLiveSyncMessage(ctx, opts, v, messagesStored, enqueueMedia, enqueueWebhookMessage, limits)
+		case *events.CallOffer, *events.CallAccept, *events.CallPreAccept, *events.CallTransport,
+			*events.CallOfferNotice, *events.CallRelayLatency, *events.CallTerminate, *events.CallReject:
+			lastEvent.Store(nowUTC().UnixNano())
+			a.handleLiveCallEvent(ctx, v)
+		case *events.AppState, *events.Star, *events.DeleteForMe,
+			*events.Archive, *events.Pin, *events.Mute, *events.MarkChatAsRead:
+			lastEvent.Store(nowUTC().UnixNano())
+			a.handleAppStatePersistenceEvent(ctx, v, nil)
+		case *events.HistorySync:
+			lastEvent.Store(nowUTC().UnixNano())
+			a.handleHistorySync(ctx, opts, v, messagesStored, lastEvent, enqueueMedia, limits)
+		case *events.Receipt:
+			lastEvent.Store(nowUTC().UnixNano())
+			a.handleReceiptPersistenceEvent(ctx, v)
+			if opts.WebhookEvents.Enabled(SyncWebhookEventReceipt) {
+				if job, ok := newSyncWebhookReceiptEvent(v); ok {
+					enqueueWebhook(job)
+				}
+			}
+		case *events.ChatPresence:
+			// Deliberately does not touch lastEvent: typing notifications must
+			// not keep an idle-exit sync alive.
+			if opts.WebhookEvents.Enabled(SyncWebhookEventChatPresence) {
+				if job, ok := newSyncWebhookChatPresenceEvent(v); ok {
+					enqueueWebhook(job)
+				}
+			}
+		case *events.OfflineSyncPreview:
+			// Emitted right after connecting when the server is about to send
+			// what this device missed while it was down.
+			a.emitOrPrint("offline_sync_preview", map[string]any{
+				"total":            v.Total,
+				"messages":         v.Messages,
+				"receipts":         v.Receipts,
+				"notifications":    v.Notifications,
+				"app_data_changes": v.AppDataChanges,
+			}, "\nReplaying offline backlog: %d message(s), %d event(s) total.\n", v.Messages, v.Total)
+		case *events.OfflineSyncCompleted:
+			a.emitOrPrint("offline_sync_completed", map[string]any{
+				"count": v.Count,
+			}, "\nOffline backlog replayed (%d event(s)).\n", v.Count)
+		case *events.Connected:
+			a.emitOrPrint("connected", nil, "\nConnected.\n")
+			ps.mu.Lock()
+			if !ps.cleanupStarted && opts.PresenceMode.SendsAvailablePresence() {
+				a.sendPresenceBounded(types.PresenceAvailable)
+			}
+			ps.mu.Unlock()
+		case *events.KeepAliveTimeout:
+			a.handleKeepAliveTimeout(opts, v, staleReconnect)
+		case *events.PushNameSetting:
+			ps.mu.Lock()
+			if !ps.cleanupStarted && opts.PresenceMode.SendsAvailablePresence() {
+				a.sendPresenceBounded(types.PresenceAvailable)
+			}
+			ps.mu.Unlock()
+		case *events.Disconnected:
+			a.emitOrPrint("disconnected", nil, "\nDisconnected.\n")
+			select {
+			case disconnected <- struct{}{}:
+			default:
+			}
+		case *events.StreamReplaced:
+			a.emitOrPrint("stream_replaced", nil, "\nStream replaced.\n")
+			// whatsmeow emits StreamReplaced before onDisconnect necessarily
+			// clears the socket, so force-close before reconnecting.
+			a.wa.Close()
+			select {
+			case disconnected <- struct{}{}:
+			default:
+			}
+		case *events.AppStateSyncError:
+			a.handleAppStateSyncError(ctx, v, &appStateRecoveries)
+		case *events.LoggedOut:
+			// WhatsApp revoked this session (linked device removed on the phone,
+			// or a logout/ban). whatsmeow reconnects on Disconnected, so without
+			// this the follow loop spins forever against a dead session. Surface
+			// the logout and signal the loop to stop instead of reconnecting.
+			a.emitOrPrint("logged_out", map[string]any{
+				"reason":      v.Reason.String(),
+				"reason_code": int(v.Reason),
+				"on_connect":  v.OnConnect,
+				"recovery":    loggedOutRecoveryHint,
+			}, "\nLogged out of WhatsApp (%s). Stopping sync.\n%s\n", v.Reason.String(), loggedOutRecoveryHint)
+			select {
+			case loggedOut <- struct{}{}:
+			default:
+			}
+		}
+	})
+}
+
+func (a *App) handleKeepAliveTimeout(opts SyncOptions, evt *events.KeepAliveTimeout, staleReconnect chan<- staleReconnectRequest) {
+	if opts.Mode != SyncModeFollow || opts.StaleThreshold <= 0 || evt == nil || evt.LastSuccess.IsZero() {
+		return
+	}
+	idle := time.Since(evt.LastSuccess)
+	if idle < opts.StaleThreshold {
+		return
+	}
+	req := staleReconnectRequest{
+		threshold:   opts.StaleThreshold,
+		idle:        idle,
+		errorCount:  evt.ErrorCount,
+		lastSuccess: evt.LastSuccess,
+		source:      "keepalive_timeout",
+	}
+	select {
+	case staleReconnect <- req:
+	default:
+	}
+}
+
+func syncActivityEvent(evt interface{}) bool {
+	switch evt.(type) {
+	case nil,
+		*events.KeepAliveTimeout,
+		*events.PairError,
+		*events.LoggedOut,
+		*events.StreamReplaced,
+		*events.ManualLoginReconnect,
+		*events.TemporaryBan,
+		*events.ConnectFailure,
+		*events.ClientOutdated,
+		*events.CATRefreshError,
+		*events.StreamError,
+		*events.Disconnected,
+		*events.AppStateSyncError,
+		*events.MediaRetryError:
+		return false
+	default:
+		return true
+	}
+}
+
+func (a *App) handleAppStatePersistenceEvent(ctx context.Context, evt interface{}, tracker *appStatePersistenceTracker) {
+	if tracker != nil {
+		a.persistAppStateEvent(ctx, evt, tracker)
+		return
+	}
+	ticket := a.appStatePersist.reserveLive()
+	markers, markerErr := a.markLiveAppStateRecovery(evt)
+	if markerErr != nil {
+		a.emitWarning(
+			"app_state_recovery_marker_failed",
+			fmt.Sprintf("warning: failed to mark live app state recovery: %v", markerErr),
+			map[string]any{"error": markerErr.Error()},
+		)
+		persistCtx := context.WithoutCancel(ctx)
+		a.persistAppStateEvent(persistCtx, evt, nil)
+		retryMarkers, retryErr := a.markLiveAppStateRecovery(evt)
+		if retryErr != nil {
+			a.emitWarning(
+				"app_state_recovery_marker_failed",
+				fmt.Sprintf("warning: failed to restore live app state recovery before ordered replay: %v", retryErr),
+				map[string]any{"error": retryErr.Error()},
+			)
+		}
+		a.appStatePersist.completeOne(ticket, func() {
+			orderedErr := a.persistAppStateEvent(persistCtx, evt, nil)
+			if orderedErr == nil {
+				a.clearLiveAppStateRecovery(retryMarkers)
+			} else if retryErr != nil {
+				if _, finalMarkerErr := a.markLiveAppStateRecovery(evt); finalMarkerErr != nil {
+					a.emitWarning(
+						"app_state_recovery_marker_failed",
+						fmt.Sprintf("warning: failed to restore live app state recovery after ordered replay failure: %v", finalMarkerErr),
+						map[string]any{"error": finalMarkerErr.Error()},
+					)
+				}
+			}
+		})
+		return
+	}
+	persistCtx := context.WithoutCancel(ctx)
+	a.appStatePersist.completeOne(ticket, func() {
+		persistenceErr := a.persistAppStateEvent(persistCtx, evt, nil)
+		if persistenceErr == nil {
+			a.clearLiveAppStateRecovery(markers)
+		}
+	})
+}
+
+type appStateRecoveryMarker struct {
+	collection appstate.WAPatchName
+	generation int64
+}
+
+func (a *App) markLiveAppStateRecovery(evt interface{}) ([]appStateRecoveryMarker, error) {
+	collections := appStateCollectionsForEvent(evt)
+	names := make([]string, len(collections))
+	for i, collection := range collections {
+		names[i] = string(collection)
+	}
+	generations, err := a.db.MarkAppStateRecoveryGenerations(names)
+	if err != nil {
+		return nil, err
+	}
+	markers := make([]appStateRecoveryMarker, 0, len(collections))
+	for i, collection := range collections {
+		markers = append(markers, appStateRecoveryMarker{collection: collection, generation: generations[i]})
+	}
+	return markers, nil
+}
+
+func (a *App) clearLiveAppStateRecovery(markers []appStateRecoveryMarker) {
+	for _, marker := range markers {
+		if err := a.db.ClearAppStateRecoveryIntent(string(marker.collection), marker.generation); err != nil {
+			a.emitWarning(
+				"app_state_recovery_marker_clear_failed",
+				fmt.Sprintf("warning: failed to clear live app state recovery for %s: %v", marker.collection, err),
+				map[string]any{"collection": string(marker.collection), "error": err.Error()},
+			)
+		}
+	}
+}
+
+func (a *App) persistAppStateEvent(ctx context.Context, evt interface{}, tracker *appStatePersistenceTracker) error {
+	var err error
+	switch v := evt.(type) {
+	case *events.AppState:
+		err = a.handleLiveCallEvent(ctx, v)
+	case *events.Star:
+		err = a.handleStarEvent(ctx, v)
+	case *events.DeleteForMe:
+		err = a.handleDeleteForMeEvent(ctx, v)
+	case *events.Archive, *events.Pin, *events.Mute, *events.MarkChatAsRead:
+		err = a.handleChatStateEvent(ctx, v)
+	}
+	if tracker != nil {
+		tracker.record(err)
+	}
+	return err
+}
+
+func appStateCollectionsForEvent(evt interface{}) []appstate.WAPatchName {
+	switch v := evt.(type) {
+	case *events.Archive, *events.Pin, *events.MarkChatAsRead:
+		return []appstate.WAPatchName{appstate.WAPatchRegularLow}
+	case *events.Mute, *events.Star, *events.DeleteForMe:
+		return []appstate.WAPatchName{appstate.WAPatchRegularHigh}
+	case *events.AppState:
+		if v == nil || v.SyncActionValue == nil || (v.GetCallLogAction() == nil && v.GetDeleteIndividualCallLog() == nil) {
+			return nil
+		}
+		return appstate.AllPatchNames[:]
+	default:
+		return nil
+	}
+}
+
+func (a *App) handleReceiptPersistenceEvent(ctx context.Context, evt *events.Receipt) {
+	if evt == nil || evt.Type != types.ReceiptTypeReadSelf || evt.Chat.IsEmpty() {
+		return
+	}
+	a.handleReceiptEvent(ctx, evt)
+}
+
+func (a *App) handleReceiptEvent(ctx context.Context, evt *events.Receipt) {
+	chat := a.canonicalStoreJID(ctx, evt.Chat)
+	if err := a.db.SetChatUnreadCount(canonicalJIDString(chat), 0); err != nil {
+		a.emitWarning(
+			"receipt_read_self_store_failed",
+			fmt.Sprintf("warning: failed to clear unread count from read-self receipt for chat %s: %v", chat, err),
+			map[string]any{"chat_jid": chat.String(), "error": err.Error()},
+		)
+	}
+}
+
+func (a *App) handleDeleteForMeEvent(ctx context.Context, evt *events.DeleteForMe) error {
+	if evt == nil || evt.ChatJID.IsEmpty() || strings.TrimSpace(evt.MessageID) == "" {
+		return nil
+	}
+	chat := a.canonicalStoreJID(ctx, evt.ChatJID)
+	chatJID := canonicalJIDString(chat)
+	if err := a.db.UpsertChat(chatJID, chatKind(chat), a.wa.ResolveChatName(ctx, chat, ""), evt.Timestamp); err != nil {
+		a.emitWarning(
+			"delete_for_me_chat_store_failed",
+			fmt.Sprintf("warning: failed to store chat for delete-for-me message %s: %v", evt.MessageID, err),
+			map[string]any{"message_id": evt.MessageID, "error": err.Error()},
+		)
+		return err
+	}
+
+	senderJID := ""
+	if !evt.IsFromMe {
+		switch {
+		case !evt.SenderJID.IsEmpty():
+			senderJID = canonicalJIDString(a.canonicalStoreJID(ctx, evt.SenderJID))
+		case chat.Server == types.DefaultUserServer:
+			senderJID = chatJID
+		}
+	}
+	if err := a.db.MarkMessageDeletedForMe(chatJID, evt.MessageID, senderJID, evt.IsFromMe, evt.Timestamp); err != nil {
+		a.emitWarning(
+			"delete_for_me_store_failed",
+			fmt.Sprintf("warning: failed to store delete-for-me state for message %s: %v", evt.MessageID, err),
+			map[string]any{"message_id": evt.MessageID, "error": err.Error()},
+		)
+		return err
+	}
+	return nil
+}
+
+func (a *App) handleLiveCallEvent(ctx context.Context, evt interface{}) error {
+	self := a.linkedLiveCallIdentity()
+	var alternateSelf []types.JID
+	if _, ok := evt.(*events.AppState); ok {
+		identities := a.linkedCallIdentities()
+		if len(identities) > 0 {
+			self = identities[0]
+			alternateSelf = identities[1:]
+		}
+	}
+	// Each whatsmeow app-state event carries one call-log action; this parser
+	// returns one call record, while that record may contain many participants.
+	call, ok := wa.ParseLiveCallEvent(evt, self, alternateSelf...)
+	if ok {
+		if err := a.storeParsedCallEvent(ctx, call, "", ""); err != nil {
+			a.emitWarning(
+				"call_event_store_failed",
+				fmt.Sprintf("warning: failed to store call event %s: %v", call.EventType, err),
+				map[string]any{"event_type": call.EventType, "call_id": call.CallID, "error": err.Error()},
+			)
+			return err
+		}
+		return nil
+	}
+
+	deleted, ok := wa.ParseCallLogDeleteEvent(evt)
+	if !ok {
+		return nil
+	}
+	if err := a.deleteParsedCallEvents(ctx, deleted); err != nil {
+		a.emitWarning(
+			"call_event_delete_failed",
+			fmt.Sprintf("warning: failed to delete call log events: %v", err),
+			map[string]any{"chat_jid": deleted.Chat.String(), "direction": deleted.Direction, "error": err.Error()},
+		)
+		return err
+	}
+	return nil
+}
+
+func (a *App) linkedCallIdentities() []types.JID {
+	identities := make([]types.JID, 0, 2)
+	if linked := strings.TrimSpace(a.wa.LinkedLID()); linked != "" {
+		if jid, err := types.ParseJID(linked); err == nil {
+			identities = append(identities, jid)
+		}
+	}
+	if linked := strings.TrimSpace(a.wa.LinkedJID()); linked != "" {
+		if jid, err := types.ParseJID(linked); err == nil {
+			identities = append(identities, jid)
+		}
+	}
+	return identities
+}
+
+func (a *App) linkedLiveCallIdentity() types.JID {
+	if linked := strings.TrimSpace(a.wa.LinkedJID()); linked != "" {
+		if jid, err := types.ParseJID(linked); err == nil {
+			return jid
+		}
+	}
+	return types.JID{}
+}
+
+func (a *App) handleStarEvent(ctx context.Context, evt *events.Star) error {
+	if evt == nil || evt.ChatJID.IsEmpty() || strings.TrimSpace(evt.MessageID) == "" || evt.Action == nil {
+		return nil
+	}
+	senderJID := ""
+	if !evt.SenderJID.IsEmpty() {
+		senderJID = canonicalJIDString(a.canonicalStoreJID(ctx, evt.SenderJID))
+	}
+	if err := a.db.SetStarred(store.SetStarredParams{
+		ChatJID:   canonicalJIDString(a.canonicalStoreJID(ctx, evt.ChatJID)),
+		MsgID:     evt.MessageID,
+		SenderJID: senderJID,
+		FromMe:    evt.IsFromMe,
+		Starred:   evt.Action.GetStarred(),
+		StarredAt: evt.Timestamp,
+	}); err != nil {
+		a.emitWarning(
+			"starred_store_failed",
+			fmt.Sprintf("warning: failed to store starred state for message %s: %v", evt.MessageID, err),
+			map[string]any{"message_id": evt.MessageID, "error": err.Error()},
+		)
+		return err
+	}
+	return nil
+}
+
+func (a *App) handleAppStateSyncError(ctx context.Context, evt *events.AppStateSyncError, recoveries *sync.Map) {
+	if evt == nil || !errors.Is(evt.Error, appstate.ErrMismatchingLTHash) {
+		return
+	}
+	if a.ownsManualAppStateFetch(evt.Name) {
+		return
+	}
+	name := strings.TrimSpace(string(evt.Name))
+	if name == "" {
+		return
+	}
+	if recoveries == nil {
+		recoveries = &sync.Map{}
+	}
+	if _, loaded := recoveries.LoadOrStore(name, struct{}{}); loaded {
+		return
+	}
+
+	a.emitWarning(
+		"app_state_lthash_mismatch",
+		fmt.Sprintf("warning: app state %s hit an LTHash mismatch; requesting recovery snapshot", name),
+		map[string]any{"name": name},
+	)
+	go func() {
+		reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		reqID, err := a.wa.RequestAppStateRecovery(reqCtx, name)
+		if err != nil {
+			a.emitWarning(
+				"app_state_recovery_failed",
+				fmt.Sprintf("warning: app state %s recovery request failed: %v", name, err),
+				map[string]any{"name": name, "error": err.Error()},
+			)
+			return
+		}
+		if a.eventsEnabled() {
+			a.emitEvent("app_state_recovery_requested", map[string]any{"name": name, "id": string(reqID)})
+		} else {
+			fmt.Fprintf(os.Stderr, "\rRequested app state %s recovery (id %s)\n", name, reqID)
+		}
+	}()
+}
+
+func (a *App) handleLiveSyncMessage(ctx context.Context, opts SyncOptions, v *events.Message, messagesStored *atomic.Int64, enqueueMedia func(string, string), enqueueWebhook func(wa.ParsedMessage), limits ...*syncStorageLimits) {
+	if historySyncNotificationFromMessage(v) != nil {
+		return
+	}
+	pm := wa.ParseLiveMessage(v)
+	if pm.ReactionToID != "" && pm.ReactionEmoji == "" && v.Message != nil && v.Message.GetEncReactionMessage() != nil {
+		a.decryptEncryptedReaction(ctx, &pm, v)
+	}
+	incrementUnread := a.shouldIncrementLiveUnread(ctx, pm)
+	if err := a.storeParsedMessageForSync(ctx, pm, limits...); err == nil {
+		if incrementUnread {
+			a.incrementLiveUnread(ctx, pm)
+		}
+		a.emitSyncProgress(messagesStored.Add(1))
+		if enqueueWebhook != nil {
+			enqueueWebhook(pm)
+		}
+		sideEffectCtx := ctx
+		if ctx.Err() != nil {
+			sideEffectCtx = context.WithoutCancel(ctx)
+		}
+		a.handlePollSideEffects(sideEffectCtx, pm, v)
+	}
+	if opts.DownloadMedia && pm.Media != nil && pm.ID != "" {
+		enqueueMedia(canonicalJIDString(a.canonicalStoreJID(ctx, pm.Chat)), pm.ID)
+	}
+}
+
+func (a *App) downloadAndHandleHistorySync(ctx context.Context, opts SyncOptions, notif *waE2E.HistorySyncNotification, messagesStored, lastEvent *atomic.Int64, enqueueMedia func(string, string), limits ...*syncStorageLimits) {
+	data, err := a.wa.DownloadHistorySync(ctx, notif)
+	if err != nil {
+		a.emitWarning(
+			"history_download_failed",
+			fmt.Sprintf("warning: failed to download history sync: %v", err),
+			map[string]any{"error": err.Error()},
+		)
+		return
+	}
+	a.handleHistorySync(ctx, opts, &events.HistorySync{Data: data}, messagesStored, lastEvent, enqueueMedia, limits...)
+	if err := a.wa.DeleteHistorySyncMedia(ctx, notif); err != nil {
+		a.emitWarning(
+			"history_delete_failed",
+			fmt.Sprintf("warning: failed to delete history sync media: %v", err),
+			map[string]any{"error": err.Error()},
+		)
+	}
+}
+
+func historySyncNotificationFromMessage(v *events.Message) *waE2E.HistorySyncNotification {
+	if v == nil || v.Message == nil {
+		return nil
+	}
+	return v.Message.GetProtocolMessage().GetHistorySyncNotification()
+}
+
+const maxHistoryUnhandledPayloadWarnings = 10
+
+type historyUnhandledPayloadWarnings struct {
+	seen       map[string]struct{}
+	reported   int
+	suppressed int
+}
+
+func (w *historyUnhandledPayloadWarnings) observe(a *App, pm wa.ParsedMessage) {
+	payload := strings.TrimSpace(pm.UnhandledPayload)
+	if payload == "" {
+		return
+	}
+	if w.seen == nil {
+		w.seen = make(map[string]struct{})
+	}
+	if _, ok := w.seen[payload]; ok {
+		w.suppressed++
+		return
+	}
+	w.seen[payload] = struct{}{}
+	if w.reported >= maxHistoryUnhandledPayloadWarnings {
+		w.suppressed++
+		return
+	}
+	w.reported++
+	a.warnUnhandledPayload(pm)
+}
+
+func (w *historyUnhandledPayloadWarnings) flush(a *App) {
+	if w.suppressed == 0 {
+		return
+	}
+	a.emitWarning(
+		"unhandled_message_payloads_suppressed",
+		fmt.Sprintf(
+			"history sync suppressed %d additional unhandled-payload warnings across %d payload shapes",
+			w.suppressed, len(w.seen),
+		),
+		map[string]any{
+			"suppressed_messages": w.suppressed,
+			"unique_payloads":     len(w.seen),
+		},
+	)
+}
+
+func (a *App) handleHistorySync(ctx context.Context, opts SyncOptions, v *events.HistorySync, messagesStored, lastEvent *atomic.Int64, enqueueMedia func(string, string), limits ...*syncStorageLimits) {
+	var unhandledWarnings historyUnhandledPayloadWarnings
+	defer unhandledWarnings.flush(a)
+	a.emitOrPrint("history_sync", map[string]any{"conversations": len(v.Data.Conversations)}, "\nProcessing history sync (%d conversations)...\n", len(v.Data.Conversations))
+	a.storeHistoryCallLogRecords(ctx, v, lastEvent)
+	for _, conv := range v.Data.Conversations {
+		lastEvent.Store(nowUTC().UnixNano())
+		chatID := strings.TrimSpace(conv.GetID())
+		if chatID == "" {
+			continue
+		}
+		a.storeHistoryUnreadCount(ctx, chatID, conv)
+		var pendingPolls []historyPollSideEffect
+		for _, m := range conv.Messages {
+			lastEvent.Store(nowUTC().UnixNano())
+			if m.Message == nil {
+				continue
+			}
+			pm := wa.ParseHistoryMessage(chatID, m.Message)
+			if pm.ID == "" || pm.Chat.IsEmpty() {
+				continue
+			}
+			var pollEvt *events.Message
+			if normalized, evt, ok := a.normalizeHistoryPollMessage(pm, m.Message); ok {
+				pm = normalized
+				pollEvt = evt
+			}
+			if pm.ReactionToID != "" && pm.ReactionEmoji == "" && m.Message.GetMessage().GetEncReactionMessage() != nil {
+				evt, err := a.wa.ParseWebMessage(pm.Chat, m.Message)
+				if err != nil {
+					a.emitWarning(
+						"encrypted_reaction_parse_failed",
+						fmt.Sprintf("warning: failed to parse encrypted reaction message %s: %v", pm.ID, err),
+						map[string]any{"message_id": pm.ID, "error": err.Error()},
+					)
+				} else {
+					a.decryptEncryptedReaction(ctx, &pm, evt)
+				}
+			}
+			storedPM := pm
+			storedPM.UnhandledPayload = ""
+			if err := a.storeParsedMessageForSync(ctx, storedPM, limits...); err == nil {
+				unhandledWarnings.observe(a, pm)
+				a.emitSyncProgress(messagesStored.Add(1))
+				if pm.Poll != nil || pm.PollAdd != nil || pm.PollVote != nil {
+					pendingPolls = append(pendingPolls, historyPollSideEffect{pm: pm, evt: pollEvt, hist: m.Message})
+				}
+			} else if ctx.Err() != nil {
+				a.handleHistoryPollSideEffectsBatch(context.WithoutCancel(ctx), pendingPolls)
+				return
+			}
+			if opts.DownloadMedia && pm.Media != nil && pm.ID != "" {
+				enqueueMedia(canonicalJIDString(a.canonicalStoreJID(ctx, pm.Chat)), pm.ID)
+			}
+		}
+		flushCtx := ctx
+		if ctx.Err() != nil {
+			flushCtx = context.WithoutCancel(ctx)
+		}
+		a.handleHistoryPollSideEffectsBatch(flushCtx, pendingPolls)
+	}
+	if !a.eventsEnabled() {
+		a.emitOrPrint("progress", map[string]any{"messages_synced": messagesStored.Load()}, "\rSynced %d messages...", messagesStored.Load())
+	}
+}
+
+func (a *App) storeHistoryCallLogRecords(ctx context.Context, v *events.HistorySync, lastEvent *atomic.Int64) {
+	if v == nil || v.Data == nil {
+		return
+	}
+	identities := a.linkedCallIdentities()
+	self := types.JID{}
+	var alternateSelf []types.JID
+	if len(identities) > 0 {
+		self = identities[0]
+		alternateSelf = identities[1:]
+	}
+	for _, record := range v.Data.GetCallLogRecords() {
+		lastEvent.Store(nowUTC().UnixNano())
+		call, ok := wa.ParseCallLogRecord(record, self, alternateSelf...)
+		if !ok {
+			continue
+		}
+		if err := a.storeParsedCallEvent(ctx, call, "", ""); err != nil {
+			a.emitWarning(
+				"history_call_log_store_failed",
+				fmt.Sprintf("warning: failed to store history call log %s: %v", call.CallID, err),
+				map[string]any{"call_id": call.CallID, "error": err.Error()},
+			)
+		}
+	}
+}
+
+func (a *App) incrementLiveUnread(ctx context.Context, pm wa.ParsedMessage) {
+	chat := a.canonicalStoreJID(ctx, pm.Chat)
+	if err := a.db.IncrementChatUnread(canonicalJIDString(chat)); err != nil {
+		a.emitWarning(
+			"live_unread_store_failed",
+			fmt.Sprintf("warning: failed to increment unread count for chat %s: %v", chat, err),
+			map[string]any{"chat_jid": chat.String(), "error": err.Error()},
+		)
+	}
+}
+
+func (a *App) shouldIncrementLiveUnread(ctx context.Context, pm wa.ParsedMessage) bool {
+	if pm.FromMe || pm.ID == "" || pm.Chat.IsEmpty() || pm.Chat == types.StatusBroadcastJID {
+		return false
+	}
+	chat := canonicalJIDString(a.canonicalStoreJID(ctx, pm.Chat))
+	if chat == "" {
+		return false
+	}
+	_, err := a.db.GetMessage(chat, pm.ID)
+	return errors.Is(err, sql.ErrNoRows)
+}
+
+func (a *App) storeHistoryUnreadCount(ctx context.Context, chatID string, conv *waHistorySync.Conversation) {
+	if conv == nil || (conv.UnreadCount == nil && conv.MarkedAsUnread == nil) {
+		return
+	}
+	chat, err := types.ParseJID(chatID)
+	if err != nil || chat.IsEmpty() {
+		return
+	}
+	count := int(conv.GetUnreadCount())
+	chat = a.canonicalStoreJID(ctx, chat)
+	var storeErr error
+	if count > 0 {
+		storeErr = a.db.SetChatUnreadCount(canonicalJIDString(chat), count)
+	} else if conv.GetMarkedAsUnread() {
+		storeErr = a.db.SetChatUnread(canonicalJIDString(chat), true)
+	} else {
+		storeErr = a.db.SetChatUnreadCount(canonicalJIDString(chat), 0)
+	}
+	if storeErr != nil {
+		a.emitWarning(
+			"history_unread_store_failed",
+			fmt.Sprintf("warning: failed to store unread count for chat %s: %v", chat, storeErr),
+			map[string]any{"chat_jid": chat.String(), "unread_count": count, "error": storeErr.Error()},
+		)
+	}
+}
+
+func (a *App) emitSyncProgress(total int64) {
+	if total <= 0 || total%25 != 0 {
+		return
+	}
+	a.emitOrPrint("progress", map[string]any{"messages_synced": total}, "\rSynced %d messages...", total)
+}
+
+func (a *App) storeParsedMessageForSync(ctx context.Context, pm wa.ParsedMessage, limits ...*syncStorageLimits) error {
+	if len(limits) > 0 && limits[0] != nil {
+		return limits[0].StoreParsedMessage(ctx, pm)
+	}
+	return a.storeParsedMessage(ctx, pm)
+}
+
+func (a *App) decryptEncryptedReaction(ctx context.Context, pm *wa.ParsedMessage, msg *events.Message) {
+	reaction, err := a.wa.DecryptReaction(ctx, msg)
+	if err != nil {
+		a.emitWarning(
+			"encrypted_reaction_decrypt_failed",
+			fmt.Sprintf("warning: failed to decrypt reaction message %s: %v", pm.ID, err),
+			map[string]any{"message_id": pm.ID, "error": err.Error()},
+		)
+		return
+	}
+	if reaction == nil {
+		return
+	}
+	pm.ReactionEmoji = reaction.GetText()
+	if pm.ReactionToID == "" {
+		if key := reaction.GetKey(); key != nil {
+			pm.ReactionToID = key.GetID()
+		}
+	}
+}
+
+// sendPresence sends a global presence update if the WhatsApp client is ready.
+// Errors are logged as warnings but never stop sync.
+func (a *App) sendPresence(ctx context.Context, presence types.Presence) {
+	if a.wa == nil {
+		return
+	}
+	if err := a.wa.SendPresence(ctx, presence); err != nil {
+		a.emitWarning(
+			"send_presence_failed",
+			fmt.Sprintf("warning: failed to send %s presence: %v", presence, err),
+			map[string]any{"presence": string(presence), "error": err.Error()},
+		)
+	}
+}
+
+// sendPresenceBounded sends a presence update with a 5-second timeout so a
+// stalled WhatsApp write cannot hold the event handler dispatch lock or
+// block shutdown from reaching the final unavailable cleanup send.
+func (a *App) sendPresenceBounded(presence types.Presence) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	a.sendPresence(ctx, presence)
+}

@@ -30,8 +30,23 @@ target_include_directories(whatsapp-gui PRIVATE src)
 target_link_libraries(whatsapp-gui PRIVATE
     Qt6::Core Qt6::Gui Qt6::Network Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Multimedia Qt6::WebEngineQuick)
 
+# The Go backend: a single binary embedding wacli (vendored under wacli/).
+file(GLOB_RECURSE HELPER_SOURCES ${CMAKE_SOURCE_DIR}/wacli/*.go)
+set(HELPER_BIN ${CMAKE_BINARY_DIR}/helper/whatsapp)
+add_custom_command(
+    OUTPUT ${HELPER_BIN}
+    COMMAND ${CMAKE_COMMAND} -E env GOFLAGS=-mod=mod
+            go build -tags sqlite_fts5 -o ${HELPER_BIN}
+            ./cmd/whatsapp-helper
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/wacli
+    DEPENDS ${HELPER_SOURCES}
+    COMMENT "Building the Go helper (wacli embedded)"
+    VERBATIM)
+add_custom_target(helper ALL DEPENDS ${HELPER_BIN})
+
 include(GNUInstallDirs)
 install(TARGETS whatsapp-gui RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(PROGRAMS helper/whatsapp DESTINATION ${CMAKE_INSTALL_LIBDIR}/whatsapp-gui)
+install(PROGRAMS ${HELPER_BIN} DESTINATION ${CMAKE_INSTALL_LIBDIR}/whatsapp-gui
+        RENAME whatsapp)
 install(FILES share/applications/whatsapp-gui.desktop
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/applications)

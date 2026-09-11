@@ -44,21 +44,16 @@ WhatsApp::WhatsApp(QQmlEngine *engine, QObject *parent)
     startDaemon();
 
     m_debounce.setSingleShot(true);
-    m_debounce.setInterval(250);
+    m_debounce.setInterval(100);  // coalesce sync-write bursts; not felt as latency
     connect(&m_debounce, &QTimer::timeout, this, &WhatsApp::refreshChats);
 
-    // wacli persists a sent/received row a beat after the socket call returns,
-    // so a single reload races the write. Poll a few times to catch up.
-    m_postSend.setInterval(800);
-    connect(&m_postSend, &QTimer::timeout, this, [this] {
-        if (--m_postSendTicks <= 0)
-            m_postSend.stop();
-        if (!m_selectedJid.isEmpty())
-            loadMessages(m_selectedJid);
-        refreshChats();
-    });
+    // Sends and reactions are persisted by the helper before it answers, so
+    // the reload right below already sees the row — no catch-up poll needed.
 
-    m_fallback.setInterval(6000);
+    // Integrity check, not an update channel: updates arrive via inotify and
+    // fileChanged re-arms lost watches. This only catches a watch that died
+    // without firing (Qt bug territory) and stale sync-daemon status.
+    m_fallback.setInterval(60000);
     connect(&m_fallback, &QTimer::timeout, this, [this] {
         startWatch();
         refreshChats();
@@ -183,8 +178,7 @@ void WhatsApp::startDaemon() {
     m_stdout.clear();
     m_oneShotPending = false;
     m_daemonUptime.start();
-    m_proc.start(QStringLiteral("python3"),
-                 {QStringLiteral("-B"), helperPath(), QStringLiteral("--daemon")});
+    m_proc.start(helperPath(), {QStringLiteral("--daemon")});
 }
 
 void WhatsApp::onDaemonExit(int code, QProcess::ExitStatus) {
@@ -258,12 +252,10 @@ void WhatsApp::kick() {
         m_proc.write("\n");
         return;
     }
-    // Fallback: one Python process per call.
-    QStringList cmd{QStringLiteral("-B"), helperPath()};
-    cmd += m_current.args;
+    // Fallback: one helper process per call.
     m_oneShotPending = true;
     m_daemonUptime.start();
-    m_proc.start(QStringLiteral("python3"), cmd);
+    m_proc.start(helperPath(), m_current.args);
 }
 
 void WhatsApp::handleResponse(const QByteArray &line) {
@@ -499,8 +491,6 @@ void WhatsApp::apply(const Job &job, const QVariantMap &data) {
         if (!m_selectedJid.isEmpty())
             loadMessages(m_selectedJid);
         refreshChats();
-        m_postSendTicks = 4;
-        m_postSend.start();
         return;
     }
     if (kind == QLatin1String("downloaded")) {
@@ -508,11 +498,10 @@ void WhatsApp::apply(const Job &job, const QVariantMap &data) {
         return;
     }
     if (kind == QLatin1String("reacted")) {
-        // wacli writes the reaction row a beat later, same race as send.
+        // Reaction rows persist before the helper answers, same as sends.
         if (!m_selectedJid.isEmpty())
             loadMessages(m_selectedJid);
-        m_postSendTicks = 4;
-        m_postSend.start();
+        refreshChats();
         return;
     }
     if (kind == QLatin1String("link-preview")) {
@@ -828,6 +817,16 @@ void WhatsApp::markRead() {
     refreshChats();
 }
 
+// ponytail: one app-state round trip per unread chat; batch it if the list ever gets long.
+void WhatsApp::markAllRead() {
+    for (const QVariant &item : m_chats) {
+        const QVariantMap chat = item.toMap();
+        if (chat.value(QStringLiteral("unreadCount")).toInt() <= 0)
+            continue;
+        ackChat(chat.value(QStringLiteral("jid")).toString());
+    }
+}
+
 void WhatsApp::setReceipts(bool on) {
     call({QStringLiteral("receipts"), on ? QStringLiteral("--on") : QStringLiteral("--off")},
          QStringLiteral("receipts"));
@@ -939,9 +938,8 @@ void WhatsApp::pickEmoji(QJSValue done) {
         p->deleteLater();
         finishJs(done, QStringLiteral("could not open emoji menu"), {});
     });
-    p->start(QStringLiteral("python3"),
-             {QStringLiteral("-B"), helperPath(), QStringLiteral("pick-emoji"),
-              QStringLiteral("--watch-only")});
+    p->start(helperPath(), {QStringLiteral("pick-emoji"),
+             QStringLiteral("--watch-only")});
 }
 
 void WhatsApp::clipboard(QJSValue done) {

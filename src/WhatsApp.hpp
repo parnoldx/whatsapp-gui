@@ -70,6 +70,7 @@ public:
     Q_INVOKABLE void refreshChats();
     Q_INVOKABLE void selectChat(const QString &jid);
     Q_INVOKABLE void markRead();
+    Q_INVOKABLE void markAllRead();
     Q_INVOKABLE void setReceipts(bool on);
     Q_INVOKABLE void setOnline(bool on);
     Q_INVOKABLE void sendText(const QString &text, const QVariantList &mentions, const QString &replyId);
@@ -171,8 +172,6 @@ private:
     QFileSystemWatcher m_watcher;
     QTimer m_debounce;
     QTimer m_fallback;
-    QTimer m_postSend;
-    int m_postSendTicks{0};
     QSet<QString> m_previewPending;
     QVariantMap m_previewCache;
     QSet<QString> m_avatarPending;
