@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -439,6 +440,41 @@ func downloadMedia(store, jid, msgID string) (map[string]any, *helperError) {
 	}
 	_ = os.Chmod(folder, 0o700)
 	dest := filepath.Join(folder, mediaKey(jid, msgID)+mediaExt(mimeType.String, filename.String, kind))
+	// The transfer takes up to 180s. The daemon serves one request at a time, so
+	// run it off the pipe and push the result when it lands; the GUI leaves the
+	// message undownloaded until then.
+	if pushable() {
+		key := jid + "\x00" + msgID
+		mediaMu.Lock()
+		if !mediaFetching[key] {
+			mediaFetching[key] = true
+			go func() {
+				defer func() {
+					mediaMu.Lock()
+					delete(mediaFetching, key)
+					mediaMu.Unlock()
+				}()
+				data, he := fetchMedia(store, jid, msgID, dest, mimeType.String, kind, filename.String)
+				if he != nil {
+					data = map[string]any{"id": msgID, "error": he.msg}
+				}
+				push("downloaded", data)
+			}()
+		}
+		mediaMu.Unlock()
+		return map[string]any{"id": msgID, "pending": true}, nil
+	}
+	return fetchMedia(store, jid, msgID, dest, mimeType.String, kind, filename.String)
+}
+
+// mediaMu guards the in-flight set; one transfer per message at a time.
+var (
+	mediaMu       sync.Mutex
+	mediaFetching = map[string]bool{}
+)
+
+// fetchMedia does the slow half of downloadMedia: pull the file and describe it.
+func fetchMedia(store, jid, msgID, dest, mimeType, kind, filename string) (map[string]any, *helperError) {
 	if _, he := runWacliFn([]string{"media", "download", "--chat", jid, "--id", msgID, "--output", dest},
 		wacliOpts{store: store, timeout: 180 * time.Second, readonly: true}); he != nil {
 		return nil, he
@@ -453,13 +489,13 @@ func downloadMedia(store, jid, msgID string) (map[string]any, *helperError) {
 	if kind == "video" {
 		thumb = fileURL(videoThumb(localPath2))
 	}
-	name := filename.String
+	name := filename
 	if name == "" {
 		name = filepath.Base(localPath2)
 	}
 	return map[string]any{
 		"id": msgID, "localPath": localPath2, "fileUrl": fileURL(localPath2),
-		"thumbUrl": thumb, "mimeType": mimeType.String, "kind": kind, "filename": name,
+		"thumbUrl": thumb, "mimeType": mimeType, "kind": kind, "filename": name,
 	}, nil
 }
 
@@ -547,9 +583,11 @@ func cmdMarkRead(store, jid string, ts int64) (map[string]any, *helperError) {
 	if ts < chat.lastMessageTs {
 		ts = chat.lastMessageTs
 	}
+	prev := loadPrefs().Acks[jid]
 	result := cmdAck(jid, ts) // persist locally first, before the wacli round-trip
 	if _, he := runWacliFn([]string{"chats", "mark-read", "--chat", jid},
 		wacliOpts{store: store, timeout: 30 * time.Second, lockWait: "0s"}); he != nil {
+		cmdAck(jid, prev) // otherwise the ack sticks and the chat never retries
 		return nil, he
 	}
 	return result, nil
@@ -617,59 +655,91 @@ func pictureField(data map[string]any, keys ...string) string {
 	return ""
 }
 
+// avatarMu guards the on-disk index against the background fetchers below.
+var (
+	avatarMu       sync.Mutex
+	avatarFetching = map[string]bool{}
+)
+
+// cmdAvatar answers from the on-disk cache and never blocks. A miss needs
+// `profile picture-info`, which connects to WhatsApp and may take 20s; the
+// daemon serves one request at a time, so doing that inline stalls every chat
+// and message query queued behind it. Fetch in the background instead — the
+// GUI does not cache an empty answer, so its next refresh picks the file up.
 func cmdAvatar(store, jid string) (map[string]any, *helperError) {
 	jid = strings.TrimSpace(jid)
 	if !jidRe.MatchString(jid) {
 		return nil, fail("chat target is not a valid JID")
 	}
-	local := avatarFile(jid)
-	cached := cachedAvatarURL(jid)
+	if cached := cachedAvatarURL(jid); cached != "" {
+		avatarMu.Lock()
+		entry, _ := loadAvatarIndex()[jid].(map[string]any)
+		avatarMu.Unlock()
+		id, _ := entry["id"].(string)
+		return map[string]any{"jid": jid, "localPath": avatarFile(jid), "fileUrl": cached, "id": id}, nil
+	}
+	avatarMu.Lock()
+	if !avatarFetching[jid] {
+		avatarFetching[jid] = true
+		go func() {
+			defer func() {
+				avatarMu.Lock()
+				delete(avatarFetching, jid)
+				avatarMu.Unlock()
+			}()
+			fetchAvatar(store, jid)
+		}()
+	}
+	avatarMu.Unlock()
+	return map[string]any{"jid": jid, "localPath": "", "fileUrl": "", "id": ""}, nil
+}
+
+// fetchAvatar does the slow half: ask WhatsApp for the picture and cache it.
+// Blocking, so only the background goroutine above and the daily refresh call it.
+func fetchAvatar(store, jid string) {
+	avatarMu.Lock()
 	index := loadAvatarIndex()
+	avatarMu.Unlock()
 	entry, _ := index[jid].(map[string]any)
 	if entry == nil {
 		entry = map[string]any{}
 	}
-	if cached != "" {
-		id, _ := entry["id"].(string)
-		return map[string]any{"jid": jid, "localPath": local, "fileUrl": cached, "id": id}, nil
+	if failedAt, ok := entry["failedAt"].(float64); ok && failedAt > 0 && now()-int64(failedAt) < 600 {
+		return
 	}
-	failedAt := 0.0
-	if v, ok := entry["failedAt"].(float64); ok {
-		failedAt = v
-	}
-	if failedAt > 0 && now()-int64(failedAt) < 600 {
-		return map[string]any{"jid": jid, "localPath": "", "fileUrl": "", "id": ""}, nil
-	}
-	args := []string{"profile", "picture-info", "--jid", jid, "--preview"}
 	knownID, _ := entry["id"].(string)
+	args := []string{"profile", "picture-info", "--jid", jid, "--preview"}
 	if knownID != "" {
 		args = append(args, "--existing-id", knownID)
 	}
 	data, he := runWacliFn(args, wacliOpts{store: store, timeout: 20 * time.Second, lockWait: "0s"})
 	if he != nil {
-		index[jid] = map[string]any{"id": knownID, "failedAt": now()}
-		saveAvatarIndex(index)
-		return map[string]any{"jid": jid, "localPath": "", "fileUrl": "", "id": knownID}, nil
+		markAvatar(jid, map[string]any{"id": knownID, "failedAt": now()})
+		return
 	}
 	url := pictureField(data, "url", "URL")
 	picID := pictureField(data, "id", "ID")
 	if url == "" {
-		index[jid] = map[string]any{"id": firstNonEmpty(picID, knownID), "failedAt": now()}
-		saveAvatarIndex(index)
-		return map[string]any{"jid": jid, "localPath": "", "fileUrl": cached, "id": picID}, nil
+		markAvatar(jid, map[string]any{"id": firstNonEmpty(picID, knownID), "failedAt": now()})
+		return
 	}
 	rawData, _, _ := httpGet(url, browserUA, 1024*1024)
 	if len(rawData) == 0 {
-		index[jid] = map[string]any{"id": firstNonEmpty(picID, knownID), "failedAt": now()}
-		saveAvatarIndex(index)
-		return map[string]any{"jid": jid, "localPath": "", "fileUrl": "", "id": picID}, nil
+		markAvatar(jid, map[string]any{"id": firstNonEmpty(picID, knownID), "failedAt": now()})
+		return
 	}
-	if err := os.WriteFile(local, rawData, 0o600); err != nil {
-		return map[string]any{"jid": jid, "localPath": "", "fileUrl": "", "id": picID}, nil
+	if err := os.WriteFile(avatarFile(jid), rawData, 0o600); err != nil {
+		return
 	}
-	index[jid] = map[string]any{"id": picID, "failedAt": 0}
+	markAvatar(jid, map[string]any{"id": picID, "failedAt": 0})
+}
+
+func markAvatar(jid string, entry map[string]any) {
+	avatarMu.Lock()
+	defer avatarMu.Unlock()
+	index := loadAvatarIndex()
+	index[jid] = entry
 	saveAvatarIndex(index)
-	return map[string]any{"jid": jid, "localPath": local, "fileUrl": fileURL(local), "id": picID}, nil
 }
 
 func cmdRefreshAvatars(store string) (map[string]any, *helperError) {
@@ -690,6 +760,7 @@ func cmdRefreshAvatars(store string) (map[string]any, *helperError) {
 			_ = exec.Command("systemctl", "--user", "start", "wacli-sync").Run()
 		}
 	}()
+	avatarMu.Lock()
 	index := loadAvatarIndex()
 	for _, entry := range index {
 		if e, ok := entry.(map[string]any); ok {
@@ -697,11 +768,12 @@ func cmdRefreshAvatars(store string) (map[string]any, *helperError) {
 		}
 	}
 	saveAvatarIndex(index)
+	avatarMu.Unlock()
 	chats, _ := listChats(store, "", maxChats, false)
 	for _, c := range chats {
 		jid, _ := c["jid"].(string)
 		if jid != "" {
-			_, _ = cmdAvatar(store, jid)
+			fetchAvatar(store, jid)
 		}
 	}
 	f, err := os.OpenFile(marker, os.O_CREATE|os.O_WRONLY, 0o600)

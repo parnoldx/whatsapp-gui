@@ -14,8 +14,9 @@ import (
 )
 
 type chatStateOptions struct {
-	chat string
-	pick int
+	chat     string
+	pick     int
+	duration time.Duration
 }
 
 func newChatsArchiveCmd(flags *rootFlags, archive bool) *cobra.Command {
@@ -58,18 +59,17 @@ func newChatsPinCmd(flags *rootFlags, pin bool) *cobra.Command {
 
 func newChatsMuteCmd(flags *rootFlags) *cobra.Command {
 	opts := chatStateOptions{}
-	var duration time.Duration
 	cmd := &cobra.Command{
 		Use:   "mute",
 		Short: "Mute a chat",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runChatState(flags, opts, "mute", func(ctx context.Context, a chatStateApp, jid types.JID) error {
-				return a.MuteChat(ctx, jid, true, duration)
+				return a.MuteChat(ctx, jid, true, opts.duration)
 			})
 		},
 	}
 	addChatStateFlags(cmd, &opts)
-	cmd.Flags().DurationVar(&duration, "duration", 0, "mute duration (for example 8h, 24h, 168h); 0 means forever")
+	cmd.Flags().DurationVar(&opts.duration, "duration", 0, "mute duration (for example 8h, 24h, 168h); 0 means forever")
 	return cmd
 }
 
@@ -127,6 +127,18 @@ func runChatState(flags *rootFlags, opts chatStateOptions, action string, run fu
 
 	a, lk, err := newApp(ctx, flags, true, false)
 	if err != nil {
+		resp, delegated, delegateErr := tryDelegateSend(ctx, flags, err, sendDelegateRequest{
+			Kind:     "chat_state",
+			Type:     action,
+			To:       opts.chat,
+			Duration: durationFlagString(opts.duration),
+		})
+		if delegated {
+			if delegateErr != nil {
+				return delegateErr
+			}
+			return writeChatStateOutput(flags, action, resp.To)
+		}
 		return err
 	}
 	defer closeApp(a, lk)
@@ -156,15 +168,26 @@ func runChatState(flags *rootFlags, opts chatStateOptions, action string, run fu
 		return err
 	}
 
+	return writeChatStateOutput(flags, action, jid.String())
+}
+
+func writeChatStateOutput(flags *rootFlags, action, jid string) error {
 	if flags.asJSON {
 		return out.WriteJSON(os.Stdout, map[string]any{
 			"ok":     true,
 			"action": action,
-			"chat":   jid.String(),
+			"chat":   jid,
 		})
 	}
-	fmt.Fprintf(os.Stdout, "%s: %s\n", action, jid.String())
+	fmt.Fprintf(os.Stdout, "%s: %s\n", action, jid)
 	return nil
+}
+
+func durationFlagString(d time.Duration) string {
+	if d <= 0 {
+		return ""
+	}
+	return d.String()
 }
 
 func addChatStateFlags(cmd *cobra.Command, opts *chatStateOptions) {

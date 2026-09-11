@@ -59,6 +59,7 @@ type sendDelegateRequest struct {
 	Question             string   `json:"question,omitempty"`
 	Options              []string `json:"options,omitempty"`
 	Selectable           int      `json:"selectable,omitempty"`
+	Duration             string   `json:"duration,omitempty"`
 	PresenceState        string   `json:"presence_state,omitempty"`
 	PresenceMedia        string   `json:"presence_media,omitempty"`
 	PostSendWaitMS       int64    `json:"post_send_wait_ms,omitempty"`
@@ -293,6 +294,8 @@ func executeDelegatedSend(parent context.Context, a *app.App, req sendDelegateRe
 		return executeDelegatedPresence(ctx, a, req)
 	case "edit":
 		return executeDelegatedEdit(ctx, a, req)
+	case "chat_state":
+		return executeDelegatedChatState(ctx, a, req)
 	default:
 		return sendDelegateResponse{}, fmt.Errorf("unsupported send kind %q", req.Kind)
 	}
@@ -318,6 +321,36 @@ func executeDelegatedPresence(ctx context.Context, a *app.App, req sendDelegateR
 		return sendDelegateResponse{}, err
 	}
 	return sendDelegateResponse{OK: true, Sent: true, To: toJID.String()}, nil
+}
+
+// ponytail: JID only, no name lookup — the picker needs a terminal the daemon has not got.
+func executeDelegatedChatState(ctx context.Context, a *app.App, req sendDelegateRequest) (sendDelegateResponse, error) {
+	jid, err := wa.ParseUserOrJID(req.To)
+	if err != nil {
+		return sendDelegateResponse{}, err
+	}
+	var duration time.Duration
+	if req.Duration != "" {
+		if duration, err = time.ParseDuration(req.Duration); err != nil {
+			return sendDelegateResponse{}, err
+		}
+	}
+	switch req.Type {
+	case "archive", "unarchive":
+		err = a.ArchiveChat(ctx, jid, req.Type == "archive")
+	case "pin", "unpin":
+		err = a.PinChat(ctx, jid, req.Type == "pin")
+	case "mute", "unmute":
+		err = a.MuteChat(ctx, jid, req.Type == "mute", duration)
+	case "mark-read", "mark-unread":
+		err = a.MarkChatRead(ctx, jid, req.Type == "mark-read")
+	default:
+		return sendDelegateResponse{}, fmt.Errorf("unsupported chat state action %q", req.Type)
+	}
+	if err != nil {
+		return sendDelegateResponse{}, err
+	}
+	return sendDelegateResponse{OK: true, To: jid.String()}, nil
 }
 
 func executeDelegatedEdit(ctx context.Context, a *app.App, req sendDelegateRequest) (sendDelegateResponse, error) {

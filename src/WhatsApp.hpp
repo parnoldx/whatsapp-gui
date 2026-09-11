@@ -123,7 +123,8 @@ private:
     void updateActivity();
     static bool busySyncError(const QString &error);
     static QString jobArg(const Job &job, const QString &flag);
-    void ackChat(const QString &jid);
+    void ackChat(const QString &jid, bool force = false);
+    void clearPendingFor(const Job &job);
     void patchDownloaded(const QVariantMap &data);
     void patchLinkPreview(const QVariantMap &data);
     void patchAvatar(const QVariantMap &data);
@@ -171,6 +172,7 @@ private:
 
     QFileSystemWatcher m_watcher;
     QTimer m_debounce;
+    QElapsedTimer m_lastChatsReq;
     QTimer m_fallback;
     QSet<QString> m_previewPending;
     QVariantMap m_previewCache;

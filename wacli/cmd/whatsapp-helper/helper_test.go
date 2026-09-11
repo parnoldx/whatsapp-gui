@@ -1664,3 +1664,20 @@ func tinyMP4(t *testing.T, path string) error {
 	}
 	return nil
 }
+
+func TestMarkReadRollsAckBackWhenWacliFails(t *testing.T) {
+	resetLidMap()
+	f := newFixture(t)
+	saved := runWacliFn
+	runWacliFn = func(args []string, opts wacliOpts) (map[string]any, *helperError) {
+		return nil, fail("store is locked")
+	}
+	defer func() { runWacliFn = saved }()
+	if _, err := cmdMarkRead(f.store, "111@s.whatsapp.net", 0); err == nil {
+		t.Fatal("expected error")
+	}
+	// A stuck ack would make every later mark-read a no-op for this chat.
+	if got := loadPrefs().Acks["111@s.whatsapp.net"]; got != 0 {
+		t.Errorf("ack = %d, want 0", got)
+	}
+}

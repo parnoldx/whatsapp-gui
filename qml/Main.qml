@@ -570,7 +570,6 @@ ApplicationWindow {
                         AppButton {
                             text: "\u2713"
                             iconOnly: true
-                            active: WhatsApp.unreadBadge > 0
                             onClicked: WhatsApp.markAllRead()
                         }
                     }

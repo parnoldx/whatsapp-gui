@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -217,6 +218,8 @@ func httpURL(raw string) string {
 	return u.String()
 }
 
+var httpGetFn = httpGet
+
 func httpGet(target, ua string, limit int64) ([]byte, string, string) {
 	req, err := http.NewRequest("GET", target, nil)
 	if err != nil {
@@ -268,7 +271,7 @@ func fetchOG(raw string) map[string]string {
 	page := ""
 	final := target
 	for _, ua := range []string{crawlerUA, browserUA} {
-		rawData, ctype, got := httpGet(target, ua, 512*1024)
+		rawData, ctype, got := httpGetFn(target, ua, 512*1024)
 		final = got
 		if len(rawData) == 0 || (ctype != "" && !strings.Contains(ctype, "html") &&
 			!strings.Contains(ctype, "xml") && !strings.Contains(ctype, "json")) {
@@ -536,6 +539,16 @@ func fetchSocialPreview(raw, host string) map[string]string {
 	return out
 }
 
+// linkMu guards the on-disk cache against the background enrichers below.
+var (
+	linkMu       sync.Mutex
+	linkFetching = map[string]bool{}
+)
+
+// cmdLinkPreview answers from the cache and never blocks. Scraping a page (and
+// sometimes yt-dlp) is seconds of network, and the daemon serves one request at
+// a time — so an unresolved preview comes back bare and is pushed once it
+// resolves, rather than holding up every chat and message query behind it.
 func cmdLinkPreview(raw string) (map[string]any, *helperError) {
 	target := firstURL(raw)
 	if target == "" {
@@ -545,38 +558,78 @@ func cmdLinkPreview(raw string) (map[string]any, *helperError) {
 		return nil, fail("url is missing")
 	}
 	preview := describeLink(target)
-	cache := loadLinkCache()
-	cached, _ := cache[preview.url].(map[string]any)
-	str := func(m map[string]any, k string) string { s, _ := m[k].(string); return s }
-	if cached != nil && (str(cached, "title") != "" || str(cached, "imageUrl") != "") {
-		for _, key := range []string{"title", "description", "imageUrl"} {
-			if v := str(cached, key); v != "" {
-				switch key {
-				case "title":
-					preview.title = v
-				case "description":
-					preview.description = v
-				case "imageUrl":
-					preview.imageURL = v
-				}
+	linkMu.Lock()
+	cached, _ := loadLinkCache()[preview.url].(map[string]any)
+	linkMu.Unlock()
+	if title, image := cachedStr(cached, "title"), cachedStr(cached, "imageUrl"); title == "" && image == "" {
+		cached = nil // nothing worth showing; treat as a miss
+	}
+	if !applyLinkCache(&preview, cached) {
+		return previewToMap(preview, true), nil
+	}
+	if !pushable() {
+		return enrichLink(preview, cached)
+	}
+	url := preview.url
+	linkMu.Lock()
+	if !linkFetching[url] {
+		linkFetching[url] = true
+		go func() {
+			defer func() {
+				linkMu.Lock()
+				delete(linkFetching, url)
+				linkMu.Unlock()
+			}()
+			if data, he := enrichLink(preview, cached); he == nil {
+				push("link-preview", data)
 			}
-		}
-		cachedEmbed := str(cached, "embedUrl")
-		if !embedUsable(preview.embedURL) && embedUsable(cachedEmbed) {
-			preview.embedURL = cachedEmbed
-		}
-		if !embedUsable(preview.embedURL) {
-			fetched := fetchSocialPreview(preview.url, preview.host)
-			if e := fetched["embedUrl"]; embedUsable(e) {
-				preview.embedURL = e
-				cached["embedUrl"] = e
-				cache[preview.url] = cached
-				saveLinkCache(cache)
-			}
+		}()
+	}
+	linkMu.Unlock()
+	return previewToMap(preview, true), nil
+}
+
+func cachedStr(cached map[string]any, key string) string {
+	s, _ := cached[key].(string)
+	return s
+}
+
+// applyLinkCache merges a cached entry into preview and reports whether what is
+// left still needs a network fetch.
+func applyLinkCache(preview *linkPreview, cached map[string]any) bool {
+	if cached == nil {
+		return true
+	}
+	if v := cachedStr(cached, "title"); v != "" {
+		preview.title = v
+	}
+	if v := cachedStr(cached, "description"); v != "" {
+		preview.description = v
+	}
+	if v := cachedStr(cached, "imageUrl"); v != "" {
+		preview.imageURL = v
+	}
+	if !embedUsable(preview.embedURL) && embedUsable(cachedStr(cached, "embedUrl")) {
+		preview.embedURL = cachedStr(cached, "embedUrl")
+	}
+	// ponytail: a page with no embed at all re-fetches on every request, as it
+	// always has. Cache the "no embed" verdict if that shows up in a trace.
+	return !embedUsable(preview.embedURL)
+}
+
+// enrichLink does the slow half: scrape the page and cache what it yields.
+// Blocking, so only the background goroutine above and one-shot mode call it.
+func enrichLink(preview linkPreview, cached map[string]any) (map[string]any, *helperError) {
+	fetched := fetchSocialPreview(preview.url, preview.host)
+	if cached != nil {
+		// Only the embed was missing; everything else came from the cache.
+		if e := fetched["embedUrl"]; embedUsable(e) {
+			preview.embedURL = e
+			cached["embedUrl"] = e
+			saveLink(preview.url, cached)
 		}
 		return previewToMap(preview, true), nil
 	}
-	fetched := fetchSocialPreview(preview.url, preview.host)
 	if len(fetched) > 0 {
 		keep := map[string]any{}
 		for _, key := range []string{"title", "description", "imageUrl", "embedUrl"} {
@@ -584,17 +637,7 @@ func cmdLinkPreview(raw string) (map[string]any, *helperError) {
 				keep[key] = v
 			}
 		}
-		cache[preview.url] = keep
-		if len(cache) > 400 {
-			keys := make([]string, 0, len(cache))
-			for k := range cache {
-				keys = append(keys, k)
-			}
-			for _, k := range keys[:len(keys)-400] {
-				delete(cache, k)
-			}
-		}
-		saveLinkCache(cache)
+		saveLink(preview.url, keep)
 		if v := fetched["title"]; v != "" {
 			preview.title = v
 		}
@@ -609,4 +652,21 @@ func cmdLinkPreview(raw string) (map[string]any, *helperError) {
 		}
 	}
 	return previewToMap(preview, true), nil
+}
+
+func saveLink(url string, entry map[string]any) {
+	linkMu.Lock()
+	defer linkMu.Unlock()
+	cache := loadLinkCache()
+	cache[url] = entry
+	if len(cache) > 400 {
+		keys := make([]string, 0, len(cache))
+		for k := range cache {
+			keys = append(keys, k)
+		}
+		for _, k := range keys[:len(keys)-400] {
+			delete(cache, k)
+		}
+	}
+	saveLinkCache(cache)
 }

@@ -5,6 +5,7 @@
 
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QDebug>
 #include <QDir>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -45,7 +46,19 @@ WhatsApp::WhatsApp(QQmlEngine *engine, QObject *parent)
 
     m_debounce.setSingleShot(true);
     m_debounce.setInterval(100);  // coalesce sync-write bursts; not felt as latency
-    connect(&m_debounce, &QTimer::timeout, this, &WhatsApp::refreshChats);
+    connect(&m_debounce, &QTimer::timeout, this, [this] {
+        // A chats refresh costs ~1s. A running sync writes the DB the whole time,
+        // so the watcher re-arms this timer the moment each refresh lands and the
+        // helper stays pinned at one chats job per second until sync ends. Rate
+        // limit instead: re-arm for the remainder, so the last write still lands.
+        const int cooldown = m_syncActive ? 3000 : 500;
+        const int since = m_lastChatsReq.isValid() ? int(m_lastChatsReq.elapsed()) : cooldown;
+        if (since < cooldown) {
+            m_debounce.start(cooldown - since);
+            return;
+        }
+        refreshChats();
+    });
 
     // Sends and reactions are persisted by the helper before it answers, so
     // the reload right below already sees the row — no catch-up poll needed.
@@ -73,7 +86,10 @@ WhatsApp::WhatsApp(QQmlEngine *engine, QObject *parent)
 
     refreshStatus();
     // Refresh cached profile pictures at most once a day; helper no-ops when fresh.
-    call({QStringLiteral("refresh-avatars")}, QStringLiteral("avatar"));
+    // Detached, not a daemon job: a real run pauses wacli-sync and walks every
+    // chat, which would hold the helper's single request pipe for minutes and
+    // leave the UI on "Loading messages…". We never read the answer anyway.
+    QProcess::startDetached(helperPath(), {QStringLiteral("refresh-avatars")});
     updateActivity();
 }
 
@@ -115,6 +131,12 @@ bool WhatsApp::busySyncError(const QString &error) {
     return low.contains(QLatin1String("busy syncing"))
         || low.contains(QLatin1String("store is locked"))
         || low.contains(QLatin1String("another wacli"));
+}
+
+// ponytail: WA_DEBUG=1 traces the job queue; drop once the wedge is understood.
+static bool waDebug() {
+    static const bool on = qEnvironmentVariableIsSet("WA_DEBUG");
+    return on;
 }
 
 QString WhatsApp::jobArg(const Job &job, const QString &flag) {
@@ -190,6 +212,7 @@ void WhatsApp::onDaemonExit(int code, QProcess::ExitStatus) {
         Job job = m_current;
         m_current = Job{};
         m_busy = false;
+        clearPendingFor(job);
         if (job.kind == QLatin1String("sent") && m_sending) {
             m_sending = false;
             emit sendingChanged();
@@ -232,6 +255,28 @@ void WhatsApp::onDaemonExit(int code, QProcess::ExitStatus) {
     Q_UNUSED(code);
 }
 
+// Every abandoned job must land here, or its pending marker wedges the UI:
+// a stuck m_pendingMessagesJid makes loadMessages() a permanent no-op.
+void WhatsApp::clearPendingFor(const Job &job) {
+    if (job.kind == QLatin1String("link-preview")) {
+        const QString url = job.args.size() >= 2 ? job.args.last() : QString();
+        m_previewPending.remove(url);
+    } else if (job.kind == QLatin1String("avatar")) {
+        const QString jid = job.args.size() >= 2 ? job.args.last() : QString();
+        m_avatarPending.remove(jid);
+    } else if (job.kind == QLatin1String("messages")) {
+        const QString requested = jobArg(job, QStringLiteral("--chat"));
+        if (m_pendingMessagesJid == requested)
+            m_pendingMessagesJid.clear();
+        if (!requested.isEmpty() && requested == m_selectedJid && m_messagesJid != m_selectedJid) {
+            m_messagesJid = m_selectedJid;
+            emit loadingMessagesChanged();
+        }
+    } else if (job.kind == QLatin1String("participants")) {
+        m_participantsJid.clear();
+    }
+}
+
 void WhatsApp::kick() {
     if (m_busy || m_queue.isEmpty())
         return;
@@ -241,6 +286,13 @@ void WhatsApp::kick() {
     }
     m_busy = true;
     m_current = m_queue.dequeue();
+    if (waDebug()) {
+        QStringList kinds;
+        for (const Job &j : std::as_const(m_queue))
+            kinds << j.kind;
+        qWarning().noquote() << "[wa] run" << m_current.kind << m_current.args.value(2)
+                             << "queued:" << kinds.join(u',');
+    }
     m_stdout.clear();
     m_stderr.clear();
     updateActivity();
@@ -259,6 +311,26 @@ void WhatsApp::kick() {
 }
 
 void WhatsApp::handleResponse(const QByteArray &line) {
+    // Slow jobs (media download, link preview) answer "pending" and push the
+    // real result whenever it lands, so they never hold up the request pipe.
+    // A push is routed by its own kind — it is not the answer to m_current.
+    const QJsonObject pushed = QJsonDocument::fromJson(line).object();
+    const QString pushKind = pushed.value(QStringLiteral("push")).toString();
+    if (!pushKind.isEmpty()) {
+        m_daemonEverResponded = true;
+        const QVariantMap data = pushed.value(QStringLiteral("data")).toVariant().toMap();
+        const QString err = data.value(QStringLiteral("error")).toString();
+        if (!err.isEmpty()) {
+            if (m_lastError != err) {
+                m_lastError = err;
+                emit lastErrorChanged();
+            }
+        } else {
+            apply(Job{{}, QJSValue(), pushKind}, data);
+        }
+        updateActivity();
+        return;
+    }
     if (!m_busy)
         return;
     m_daemonEverResponded = true;
@@ -296,23 +368,8 @@ void WhatsApp::handleResponse(const QByteArray &line) {
         m_lastError.clear();
         emit lastErrorChanged();
     }
-    if (!ok && job.kind == QLatin1String("link-preview")) {
-        const QString url = job.args.size() >= 2 ? job.args.last() : QString();
-        m_previewPending.remove(url);
-    }
-    if (!ok && job.kind == QLatin1String("avatar")) {
-        const QString jid = job.args.size() >= 2 ? job.args.last() : QString();
-        m_avatarPending.remove(jid);
-    }
-    if (!ok && job.kind == QLatin1String("messages")) {
-        const QString requested = jobArg(job, QStringLiteral("--chat"));
-        if (m_pendingMessagesJid == requested)
-            m_pendingMessagesJid.clear();
-        if (!requested.isEmpty() && requested == m_selectedJid && m_messagesJid != m_selectedJid) {
-            m_messagesJid = m_selectedJid;
-            emit loadingMessagesChanged();
-        }
-    }
+    if (!ok)
+        clearPendingFor(job);
     if (!ok && job.kind == QLatin1String("sent") && m_sending) {
         m_sending = false;
         emit sendingChanged();
@@ -395,6 +452,10 @@ void WhatsApp::apply(const Job &job, const QVariantMap &data) {
     }
     if (kind == QLatin1String("messages")) {
         const QString requested = jobArg(job, QStringLiteral("--chat"));
+        if (waDebug())
+            qWarning().noquote() << "[wa] messages reply for" << requested << "selected" << m_selectedJid
+                                 << "pending" << m_pendingMessagesJid << "count"
+                                 << data.value(QStringLiteral("messages")).toList().size();
         if (!requested.isEmpty() && requested != m_selectedJid) {
             if (m_pendingMessagesJid == requested)
                 m_pendingMessagesJid.clear();
@@ -612,6 +673,7 @@ void WhatsApp::refreshStatus() {
 }
 
 void WhatsApp::refreshChats() {
+    m_lastChatsReq.start();
     if (!m_refreshing) {
         m_refreshing = true;
         emit refreshingChanged();
@@ -628,8 +690,11 @@ void WhatsApp::loadMessages(const QString &jid) {
         emit messagesChanged();
         return;
     }
-    if (m_pendingMessagesJid == jid)
+    if (m_pendingMessagesJid == jid) {
+        if (waDebug())
+            qWarning().noquote() << "[wa] loadMessages skipped, already pending" << jid;
         return;
+    }
     m_pendingMessagesJid = jid;
     call({QStringLiteral("messages"), QStringLiteral("--chat"), jid, QStringLiteral("--limit"), QStringLiteral("80")},
          QStringLiteral("messages"));
@@ -681,7 +746,7 @@ void WhatsApp::selectChat(const QString &jid) {
     ackChat(jid);
 }
 
-void WhatsApp::ackChat(const QString &jid) {
+void WhatsApp::ackChat(const QString &jid, bool force) {
     QVariantMap chat;
     for (const QVariant &item : m_chats) {
         const QVariantMap c = item.toMap();
@@ -698,7 +763,7 @@ void WhatsApp::ackChat(const QString &jid) {
         if (msg.value(QStringLiteral("chatJid")).toString() == jid)
             ts = std::max(ts, msg.value(QStringLiteral("ts")).toLongLong());
     }
-    if (ts <= m_acks.value(jid).toLongLong())
+    if (!force && ts <= m_acks.value(jid).toLongLong())
         return;
     m_acks.insert(jid, ts);
     emit acksChanged();
@@ -712,7 +777,8 @@ void WhatsApp::ackChat(const QString &jid) {
 
 void WhatsApp::patchDownloaded(const QVariantMap &data) {
     const QString id = data.value(QStringLiteral("id")).toString();
-    if (id.isEmpty())
+    // The transfer is still running; the push carries the finished file.
+    if (id.isEmpty() || data.value(QStringLiteral("pending")).toBool())
         return;
     auto apply = [&](QVariantMap &msg) {
         msg.insert(QStringLiteral("localPath"), data.value(QStringLiteral("localPath")));
@@ -823,7 +889,8 @@ void WhatsApp::markAllRead() {
         const QVariantMap chat = item.toMap();
         if (chat.value(QStringLiteral("unreadCount")).toInt() <= 0)
             continue;
-        ackChat(chat.value(QStringLiteral("jid")).toString());
+        // force: a stale local ack must not mask a chat the server still calls unread
+        ackChat(chat.value(QStringLiteral("jid")).toString(), true);
     }
 }
 

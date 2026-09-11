@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -201,18 +202,58 @@ func unwrapWacliData(payload map[string]any) (map[string]any, *helperError) {
 	}
 }
 
+// Slow commands answer "pending" and push the real result later, so one media
+// download does not stall every chat and message query behind it on the single
+// request pipe. outLine is nil in one-shot mode, where everything stays
+// synchronous — pushable() is what the slow paths branch on.
+var (
+	outMu   sync.Mutex
+	outLine func(map[string]any)
+)
+
+func writeOut(payload map[string]any) bool {
+	outMu.Lock()
+	defer outMu.Unlock()
+	if outLine == nil {
+		return false
+	}
+	outLine(payload)
+	return true
+}
+
+func pushable() bool {
+	outMu.Lock()
+	defer outMu.Unlock()
+	return outLine != nil
+}
+
+// push delivers an unsolicited result. The GUI routes it by kind instead of
+// matching it against the request it has in flight.
+func push(kind string, data map[string]any) {
+	writeOut(map[string]any{"ok": true, "push": kind, "data": data})
+}
+
 // runDaemon answers one JSON line per input line.
 func runDaemon() int {
+	dieWithParent()
 	sc := bufio.NewScanner(os.Stdin)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	w := bufio.NewWriter(os.Stdout)
 	defer w.Flush()
-	answer := func(payload map[string]any) {
+	outMu.Lock()
+	outLine = func(payload map[string]any) {
 		out, _ := json.Marshal(payload)
 		w.Write(out)
 		w.WriteByte('\n')
 		w.Flush()
 	}
+	outMu.Unlock()
+	defer func() {
+		outMu.Lock()
+		outLine = nil
+		outMu.Unlock()
+	}()
+	answer := func(payload map[string]any) { writeOut(payload) }
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
