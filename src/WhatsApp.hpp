@@ -27,6 +27,7 @@ class WhatsApp : public QObject {
     Q_PROPERTY(QVariantMap acks READ acks NOTIFY acksChanged)
     Q_PROPERTY(QVariantMap avatars READ avatars NOTIFY avatarsChanged)
     Q_PROPERTY(QVariantMap linkPreviews READ linkPreviews NOTIFY linkPreviewsChanged)
+    Q_PROPERTY(QVariantMap embedLogins READ embedLogins NOTIFY embedLoginsChanged)
     Q_PROPERTY(QString selectedJid READ selectedJid WRITE setSelectedJid NOTIFY selectedJidChanged)
     Q_PROPERTY(QVariant selectedChat READ selectedChat NOTIFY selectedChatChanged)
     Q_PROPERTY(int unreadBadge READ unreadBadge NOTIFY unreadBadgeChanged)
@@ -43,6 +44,7 @@ class WhatsApp : public QObject {
 
 public:
     explicit WhatsApp(QQmlEngine *engine, QObject *parent = nullptr);
+    ~WhatsApp() override;
 
     QVariantList chats() const { return m_chats; }
     QVariantList messages() const { return m_messages; }
@@ -50,6 +52,7 @@ public:
     QVariantMap acks() const { return m_acks; }
     QVariantMap avatars() const { return m_avatarCache; }
     QVariantMap linkPreviews() const { return m_previewCache; }
+    QVariantMap embedLogins() const { return m_embedLogins; }
     QString selectedJid() const { return m_selectedJid; }
     QVariant selectedChat() const;
     int unreadBadge() const { return m_unreadBadge; }
@@ -79,6 +82,7 @@ public:
     Q_INVOKABLE void download(const QVariantMap &message);
     Q_INVOKABLE void react(const QVariantMap &message, const QString &emoji);
     Q_INVOKABLE void fetchLinkPreview(const QString &url);
+    Q_INVOKABLE void refreshEmbedLogins();
     Q_INVOKABLE void fetchAvatar(const QString &jid);
     Q_INVOKABLE void pickFiles(QJSValue done);
     Q_INVOKABLE void openEmojiPicker();
@@ -96,6 +100,7 @@ signals:
     void acksChanged();
     void avatarsChanged();
     void linkPreviewsChanged();
+    void embedLoginsChanged();
     void selectedJidChanged();
     void selectedChatChanged();
     void unreadBadgeChanged();
@@ -176,6 +181,8 @@ private:
     QTimer m_fallback;
     QSet<QString> m_previewPending;
     QVariantMap m_previewCache;
+    QVariantMap m_embedLogins;
+    bool m_shuttingDown = false;
     QSet<QString> m_avatarPending;
     QVariantMap m_avatarCache;
     QSet<QString> m_autoDownloaded;

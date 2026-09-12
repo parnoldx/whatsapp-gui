@@ -14,11 +14,76 @@
 #include <QJsonObject>
 #include <QQmlEngine>
 #include <QStandardPaths>
+#include <QTimer>
+#include <QFile>
+#include <sqlite3.h>
 
 // ponytail: WA_DEBUG=1 traces the job queue; drop once the wedge is understood.
 static bool waDebug() {
     static const bool on = qEnvironmentVariableIsSet("WA_DEBUG");
     return on;
+}
+
+// Stop queued work and cookie updates before members tear down: timers can
+// still fire from QProcess's waitForFinished window and re-enter kick().
+WhatsApp::~WhatsApp() {
+    m_shuttingDown = true;
+    m_queue.clear();
+}
+
+// Reads login markers straight from the embed webview's cookie DB (the QML
+// profile API doesn't expose the cookie store). Covers httpOnly sessions like
+// TikTok's. Chromium commits cookies to disk lazily (~30s), so callers refresh
+// at startup, when the viewer closes, and shortly after.
+void WhatsApp::refreshEmbedLogins() {
+    if (m_shuttingDown)
+        return;
+    static const QSet<QString> loginCookies = {
+        QStringLiteral("sessionid"),   // instagram, tiktok
+        QStringLiteral("SAPISID"),     // youtube/google
+        QStringLiteral("auth_token"),  // x/twitter
+        QStringLiteral("c_user"),      // facebook
+    };
+    const QString src = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+        + QStringLiteral("/QtWebEngine/whatsapp-link-embed/Cookies");
+    if (!QFileInfo::exists(src))
+        return;
+    // Copy first: Chromium keeps the live DB locked for writers.
+    const QString tmp = QStandardPaths::writableLocation(QStandardPaths::TempLocation)
+        + QStringLiteral("/wa-cookie-scan");
+    QFile::remove(tmp);
+    if (!QFile::copy(src, tmp))
+        return;
+    sqlite3 *db = nullptr;
+    if (sqlite3_open_v2(tmp.toUtf8().constData(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+        if (db)
+            sqlite3_close(db);
+        QFile::remove(tmp);
+        return;
+    }
+    QVariantMap logins;
+    sqlite3_stmt *stmt = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT host_key, name FROM cookies", -1, &stmt, nullptr) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const QString host = QString::fromUtf8(reinterpret_cast<const char *>(sqlite3_column_text(stmt, 0)));
+            const QString name = QString::fromUtf8(reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1)));
+            if (!loginCookies.contains(name))
+                continue;
+            QString h = host;
+            if (h.startsWith(QLatin1Char('.')))
+                h.remove(0, 1);
+            if (h.startsWith(QLatin1String("www.")))
+                h.remove(0, 4);
+            logins.insert(h, true);
+        }
+        sqlite3_finalize(stmt);
+    }
+    sqlite3_close(db);
+    QFile::remove(tmp);
+    if (logins != m_embedLogins) {
+        m_embedLogins = logins;
+        emit embedLoginsChanged();
+    }
 }
 
 WhatsApp::WhatsApp(QQmlEngine *engine, QObject *parent)
@@ -284,7 +349,7 @@ void WhatsApp::clearPendingFor(const Job &job) {
 }
 
 void WhatsApp::kick() {
-    if (m_busy || m_queue.isEmpty())
+    if (m_shuttingDown || m_busy || m_queue.isEmpty())
         return;
     if (m_useDaemon && m_proc.state() != QProcess::Running) {
         startDaemon();  // resumes from the started() signal

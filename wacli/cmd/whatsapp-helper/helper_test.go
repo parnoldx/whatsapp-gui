@@ -1219,6 +1219,13 @@ func TestReactionFromClipboardRejectsJunk(t *testing.T) {
 	}
 }
 
+func stubClipboardWatch(t *testing.T, read func(string) string) {
+	savedStart, savedRead := startClipboardWatchFn, readClipboardWatchFn
+	t.Cleanup(func() { startClipboardWatchFn, readClipboardWatchFn = savedStart, savedRead })
+	startClipboardWatchFn = func() (string, func(), *helperError) { return "", func() {}, nil }
+	readClipboardWatchFn = read
+}
+
 func TestPickEmojiReturnsClipboardSelection(t *testing.T) {
 	newFixture(t)
 	state := map[string]any{"open": false, "clip": "keep-me"}
@@ -1234,6 +1241,7 @@ func TestPickEmojiReturnsClipboardSelection(t *testing.T) {
 		state["clip"] = "🔥"
 		return nil
 	}
+	stubClipboardWatch(t, func(string) string { return state["clip"].(string) })
 	got, err := cmdPickEmoji(false)
 	if err != nil || got["emoji"] != "🔥" {
 		t.Errorf("got = %v err = %v", got, err)
@@ -1257,6 +1265,7 @@ func TestPickEmojiCancelRestoresClipboard(t *testing.T) {
 		return ""
 	}
 	setClipboardFn = func(text string) { restored = append(restored, text) }
+	stubClipboardWatch(t, func(string) string { return "" })
 	got, err := cmdPickEmoji(false)
 	if err != nil || got["emoji"] != "" {
 		t.Errorf("got = %v err = %v", got, err)
@@ -1277,6 +1286,7 @@ func TestPickEmojiWatchOnlyDoesNotSummon(t *testing.T) {
 	emojiOverlayOpenFn = func() bool { return true }
 	clipboardTextFn = func() string { return "🔥" }
 	setClipboardFn = func(text string) {}
+	stubClipboardWatch(t, func(string) string { return "🔥" })
 	got, err := cmdPickEmoji(true)
 	if err != nil || got["emoji"] != "🔥" {
 		t.Errorf("got = %v err = %v", got, err)

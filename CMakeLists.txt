@@ -28,7 +28,8 @@ qt_add_resources(whatsapp-gui "qml"
 
 target_include_directories(whatsapp-gui PRIVATE src)
 target_link_libraries(whatsapp-gui PRIVATE
-    Qt6::Core Qt6::Gui Qt6::Network Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Multimedia Qt6::WebEngineQuick)
+    Qt6::Core Qt6::Gui Qt6::Network Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Multimedia Qt6::WebEngineQuick
+    sqlite3)
 
 # The Go backend: the helper binary embedding wacli (vendored under wacli/),
 # plus the wacli CLI itself, needed for the initial `wacli auth` pairing.

@@ -15,6 +15,8 @@ var (
 	setClipboardFn      = setClipboard
 	emojiOverlayOpenFn  = emojiOverlayOpen
 	summonEmojiPickerFn = summonEmojiPicker
+	startClipboardWatchFn = startClipboardWatch
+	readClipboardWatchFn  = readClipboardWatch
 )
 
 func clipboardText() string {
@@ -87,6 +89,31 @@ func reactionFromClipboard(text string) string {
 	return s
 }
 
+// startClipboardWatch spawns one long-lived wl-paste --watch process that
+// mirrors every clipboard change into a temp file. The emoji overlay's insert
+// script kills its wl-copy ~0.35s after the pick, so a poll-per-iteration
+// wl-paste spawn races and misses it; the watcher is event-driven and reads
+// the value while the source is still alive.
+func startClipboardWatch() (string, func(), *helperError) {
+	f, err := os.CreateTemp("", "wa-clip-*")
+	if err != nil {
+		return "", nil, fail("could not create clipboard watch file")
+	}
+	tmp := f.Name()
+	_ = f.Close()
+	cmd := exec.Command("wl-paste", "-n", "--watch", "/bin/sh", "-c", "wl-paste -n > "+tmp)
+	if err := cmd.Start(); err != nil {
+		os.Remove(tmp)
+		return "", nil, fail("could not watch clipboard")
+	}
+	stop := func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		os.Remove(tmp)
+	}
+	return tmp, stop, nil
+}
+
 // cmdPickEmoji opens the Omarchy emoji overlay and returns the chosen glyph.
 //
 // The overlay copies via wl-copy then pastes with wtype; we watch the
@@ -97,6 +124,11 @@ func reactionFromClipboard(text string) string {
 // waiting for this helper). Summoning again would toggle it closed.
 func cmdPickEmoji(watchOnly bool) (map[string]any, *helperError) {
 	old := clipboardTextFn()
+	watchFile, stopWatch, he := startClipboardWatchFn()
+	if he != nil {
+		return nil, he
+	}
+	defer stopWatch()
 	seen := false
 	if watchOnly {
 		appear := time.Now().Add(2 * time.Second)
@@ -125,12 +157,14 @@ func cmdPickEmoji(watchOnly bool) (map[string]any, *helperError) {
 		if emojiOverlayOpenFn() {
 			seen = true
 		}
-		if got := reactionFromClipboard(clipboardTextFn()); got != "" {
+		if got := reactionFromClipboard(readClipboardWatchFn(watchFile)); got != "" {
+			setClipboardFn(got)
 			return map[string]any{"emoji": got}, nil
 		}
 		if seen && !emojiOverlayOpenFn() {
 			time.Sleep(300 * time.Millisecond)
-			if got := reactionFromClipboard(clipboardTextFn()); got != "" {
+			if got := reactionFromClipboard(readClipboardWatchFn(watchFile)); got != "" {
+				setClipboardFn(got)
 				return map[string]any{"emoji": got}, nil
 			}
 			if !watchOnly {
@@ -144,6 +178,14 @@ func cmdPickEmoji(watchOnly bool) (map[string]any, *helperError) {
 		setClipboardFn(old)
 	}
 	return map[string]any{"emoji": ""}, nil
+}
+
+func readClipboardWatch(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 func cmdPickFiles() (map[string]any, *helperError) {

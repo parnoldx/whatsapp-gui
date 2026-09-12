@@ -6,7 +6,7 @@ Item {
     id: root
     property var message: ({})
     property bool isGroup: false
-    readonly property var reactEmojis: ["👍", "❤️", "😂", "😮", "😢", "🙏"]
+    readonly property var reactEmojis: ["👍", "❤️", "😂", "😮", "😢", "🙏", "🔥", "👏", "😍", "🤔", "😎", "🎉", "🙂"]
 
     signal openMedia(var message)
     signal download(var message)
@@ -573,26 +573,6 @@ Item {
                             }
                         }
                     }
-                    Rectangle {
-                        height: 22
-                        width: 22
-                        radius: 11
-                        color: Qt.rgba(Theme.foreground.r, Theme.foreground.g, Theme.foreground.b, 0.12)
-                        Text {
-                            anchors.centerIn: parent
-                            text: "+"
-                            textFormat: Text.PlainText
-                            color: Theme.textPrimary
-                            font.pixelSize: 14
-                        }
-                        MouseArea {
-                            anchors.fill: parent
-                            onClicked: {
-                                root.reactOpen = false
-                                root.pickReaction(root.message)
-                            }
-                        }
-                    }
                 }
 
                 Row {
@@ -641,10 +621,6 @@ Item {
                 MenuItem {
                     text: "Reply"
                     onTriggered: root.reply(root.message)
-                }
-                MenuItem {
-                    text: "React…"
-                    onTriggered: root.pickReaction(root.message)
                 }
                 MenuItem {
                     text: "Remove reaction"

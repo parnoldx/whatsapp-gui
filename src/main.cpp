@@ -48,6 +48,7 @@ int main(int argc, char *argv[]) {
 
     QGuiApplication app(argc, argv);
     app.setApplicationName(QStringLiteral("WhatsApp"));
+    app.setOrganizationName(QStringLiteral("pa"));
     app.setApplicationDisplayName(QStringLiteral("WhatsApp"));
     app.setDesktopFileName(QStringLiteral("whatsapp-gui"));
     app.setQuitOnLastWindowClosed(false);

@@ -21,6 +21,7 @@ ApplicationWindow {
     readonly property bool compact: width < 860
     property string query: ""
     property var viewer: null
+    property var embedLogins: ({ })
     property bool stickToEnd: true
     property bool pinning: false
     property real anchorY: 0
@@ -232,6 +233,15 @@ ApplicationWindow {
     function closeViewer() {
         player.stop()
         win.viewer = null
+        // A login inside the embed viewer commits to the cookie DB lazily.
+        WhatsApp.refreshEmbedLogins()
+        embedLoginRecheck.restart()
+    }
+
+    Timer {
+        id: embedLoginRecheck
+        interval: 20000
+        onTriggered: WhatsApp.refreshEmbedLogins()
     }
 
     WebEngineProfile {
@@ -240,6 +250,7 @@ ApplicationWindow {
         offTheRecord: false
         persistentCookiesPolicy: WebEngineProfile.ForcePersistentCookies
         Component.onCompleted: {
+            WhatsApp.refreshEmbedLogins()
             var prep = WebEngine.script()
             prep.name = "tiktok-embed-prep"
             prep.injectionPoint = WebEngineScript.DocumentCreation
@@ -407,6 +418,60 @@ ApplicationWindow {
         }
     }
 
+    function markEmbedLogin(host) {
+        if (win.embedLogins[host])
+            return
+        var m = Object.assign({}, win.embedLogins)
+        m[host] = true
+        win.embedLogins = m
+        WhatsApp.refreshEmbedLogins()
+    }
+
+    function embedHost(url) {
+        var m = String(url || "").match(/https?:\/\/([^\/#?]+)/)
+        return m ? m[1].replace(/^www\./, "") : ""
+    }
+
+    function svgIcon(body) {
+        return "data:image/svg+xml;utf8," + encodeURIComponent(
+            "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'>" + body + "</svg>")
+    }
+
+    function embedBrandIcon(url) {
+        var h = win.embedHost(url)
+        if (h === "instagram.com")
+            return win.svgIcon("<rect x='2.6' y='2.6' width='18.8' height='18.8' rx='5.4' fill='none' stroke='#E4405F' stroke-width='2.2'/>"
+                + "<circle cx='12' cy='12' r='4.3' fill='none' stroke='#E4405F' stroke-width='2.2'/>"
+                + "<circle cx='17.3' cy='6.7' r='1.4' fill='#E4405F'/>")
+        if (h === "tiktok.com" || h === "vm.tiktok.com")
+            return win.svgIcon("<path fill='#ffffff' d='M12.525.02c1.31-.02 2.61-.01 3.91-.02.08 1.53.63 3.09 1.75 4.17 1.12 1.11 2.7 1.62 4.24 1.79v4.03c-1.44-.05-2.89-.35-4.2-.97-.57-.26-1.1-.59-1.62-.93-.01 2.92.01 5.84-.02 8.75-.08 1.4-.54 2.79-1.35 3.94-1.31 1.92-3.58 3.17-5.91 3.21-1.43.08-2.86-.31-4.08-1.03-2.02-1.19-3.44-3.37-3.65-5.71-.02-.5-.03-1-.01-1.49.18-1.9 1.12-3.72 2.58-4.96 1.66-1.44 3.98-2.13 6.15-1.72.02 1.48-.04 2.96-.04 4.44-.99-.32-2.15-.23-3.02.37-.63.41-1.11 1.04-1.36 1.75-.21.51-.15 1.07-.14 1.61.24 1.64 1.82 3.02 3.5 2.87 1.12-.01 2.19-.66 2.77-1.61.19-.33.4-.67.41-1.06.1-1.79.06-3.57.07-5.36.01-4.03-.01-8.05.02-12.07z'/>")
+        if (h === "youtube.com" || h === "youtu.be")
+            return win.svgIcon("<path fill='#FF0000' d='M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z'/>")
+        if (h === "facebook.com")
+            return win.svgIcon("<path fill='#1877F2' d='M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z'/>")
+        if (h === "x.com" || h === "twitter.com")
+            return win.svgIcon("<path fill='#ffffff' d='M18.901 1.153h3.68l-8.04 9.19L24 22.846h-7.406l-5.8-7.584-6.638 7.584H.474l8.6-9.83L0 1.154h7.594l5.243 6.932ZM17.61 20.644h2.039L6.486 3.24H4.298Z'/>")
+        return ""
+    }
+
+    function openEmbedPage(preview) {
+        var p = preview || win.viewer
+        var target = p ? (p.url || p.pageUrl) : ""
+        if (!target)
+            return
+        player.stop()
+        win.viewer = {
+            kind: "embed",
+            embedUrl: target,
+            pageUrl: target,
+            filename: p.title || p.site || p.label || "Link",
+            direct: true,
+            failed: false
+        }
+        if (embedView.item)
+            embedView.item.loadDirect(target)
+    }
+
     function openLink(preview, external) {
         if (!preview || !preview.url)
             return
@@ -415,6 +480,13 @@ ApplicationWindow {
             return
         }
         var embed = Model.linkEmbed(preview)
+        var host = win.embedHost(preview.url)
+        // TikTok embeds are unreliable (age walls, login walls) and the real
+        // page plays fine logged out, so always open it directly.
+        if (host === "tiktok.com" || host === "vm.tiktok.com") {
+            win.openEmbedPage(preview)
+            return
+        }
         if (embed) {
             win.showEmbed(preview, embed)
             return
@@ -821,7 +893,17 @@ ApplicationWindow {
                     color: "#ffffff"
                 }
                 AppButton {
-                    text: "Open externally"
+                    visible: !!(win.viewer && win.viewer.kind === "embed" && win.viewer.pageUrl
+                        && !win.viewer.direct)
+                    icon: win.viewer && win.viewer.kind === "embed"
+                        ? win.embedBrandIcon(win.viewer.pageUrl) : ""
+                    text: "\uD83D\uDD11"
+                    iconOnly: true
+                    onClicked: win.openEmbedPage()
+                }
+                AppButton {
+                    text: "\u2197"
+                    iconOnly: true
                     onClicked: {
                         if (win.viewer && win.viewer.kind === "embed" && win.viewer.pageUrl)
                             Qt.openUrlExternally(win.viewer.pageUrl)
@@ -858,7 +940,7 @@ ApplicationWindow {
                 Text {
                     anchors.centerIn: parent
                     visible: !!(win.viewer && win.viewer.kind === "embed" && !win.viewer.embedUrl)
-                    text: (win.viewer && win.viewer.failed) ? "Couldn't play inline. Open externally." : "Loading…"
+                    text: (win.viewer && win.viewer.failed) ? "Couldn't play inline. Try 'Open page (sign in)' or open externally." : "Loading…"
                     textFormat: Text.PlainText
                     color: "#ffffff"
                     font.pixelSize: 14
@@ -877,12 +959,16 @@ ApplicationWindow {
                             settings.playbackRequiresUserGesture: false
                             profile: embedProfile
                             Component.onCompleted: boot()
+                            function loadDirect(u) {
+                                if (u)
+                                    url = u
+                            }
                             function boot() {
                                 var u = win.embedWatchUrl(win.viewer && win.viewer.embedUrl)
                                 if (!u)
                                     return
                                 var origin = win.embedFrameOrigin(u)
-                                if (origin) {
+                                if (origin && !win.viewer.direct) {
                                     loadHtml(win.embedFrameHtml(u), origin)
                                     return
                                 }
@@ -913,12 +999,18 @@ ApplicationWindow {
                                 if (info.status === WebEngineView.LoadSucceededStatus) {
                                     playTimer.tries = 0
                                     playTimer.restart()
+                                    if (win.viewer && win.viewer.direct
+                                        && win.embedHost(win.viewer.embedUrl) === "instagram.com")
+                                        embed.runJavaScript(
+                                            "(function(){return document.cookie.indexOf('ds_user_id')!==-1})()",
+                                            function(ok) { if (ok) win.markEmbedLogin("instagram.com") })
                                 }
                             }
                             onNavigationRequested: function(request) {
                                 if (!request.isMainFrame
                                     || request.navigationType !== WebEngineView.LinkClickedNavigation
-                                    || win.isEmbedPlayer(request.url.toString())) {
+                                    || win.isEmbedPlayer(request.url.toString())
+                                    || (win.viewer && win.viewer.direct)) {
                                     request.action = WebEngineView.AcceptRequest
                                     return
                                 }
