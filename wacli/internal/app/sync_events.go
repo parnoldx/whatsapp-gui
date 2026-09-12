@@ -561,6 +561,13 @@ func (a *App) handleLiveSyncMessage(ctx context.Context, opts SyncOptions, v *ev
 			sideEffectCtx = context.WithoutCancel(ctx)
 		}
 		a.handlePollSideEffects(sideEffectCtx, pm, v)
+	} else if ctx.Err() == nil {
+		// Swallowing this is how a message goes missing with nothing in the log.
+		a.emitWarning(
+			"live_message_store_failed",
+			fmt.Sprintf("warning: failed to store incoming message %s: %v", pm.ID, err),
+			map[string]any{"message_id": pm.ID, "error": err.Error()},
+		)
 	}
 	if opts.DownloadMedia && pm.Media != nil && pm.ID != "" {
 		enqueueMedia(canonicalJIDString(a.canonicalStoreJID(ctx, pm.Chat)), pm.ID)

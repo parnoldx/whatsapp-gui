@@ -402,7 +402,10 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 	chatJID := canonicalJIDString(pm.Chat)
 	chatName := a.wa.ResolveChatName(ctx, pm.Chat, pm.PushName)
 	if pm.Chat != types.StatusBroadcastJID {
-		if err := a.db.UpsertChat(chatJID, chatKind(pm.Chat), chatName, pm.Timestamp); err != nil {
+		// Row now, timestamp later: last_message_ts only moves once the message
+		// row is actually written (below), so a failed insert can no longer leave
+		// a chat whose overview jumps ahead of an empty thread.
+		if err := a.db.UpsertChatMetadata(chatJID, chatKind(pm.Chat), chatName); err != nil {
 			return err
 		}
 	}
@@ -525,6 +528,9 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 		Edited:          pm.Edited,
 		Revoked:         pm.Revoked,
 	}); err != nil {
+		return err
+	}
+	if err := a.db.UpsertChat(chatJID, chatKind(pm.Chat), chatName, pm.Timestamp); err != nil {
 		return err
 	}
 	a.warnUnhandledPayload(pm)
