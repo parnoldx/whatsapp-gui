@@ -88,9 +88,10 @@ function filterChats(chats, query) {
   return out
 }
 
+// The open chat is not exempt: messages that arrive while the window is
+// inactive stay unread until the user clicks into the chat again.
 function visibleUnread(chat, acks, selectedJid) {
   if (!chat) return 0
-  if (selectedJid && chat.jid === selectedJid) return 0
   var ack = Number((acks && acks[chat.jid]) || 0)
   if (Number(chat.lastMessageTs || 0) <= ack) return 0
   return Number(chat.unreadCount || 0)

@@ -4,6 +4,7 @@
 #include <utility>
 
 #include <QCoreApplication>
+#include <QGuiApplication>
 #include <QDateTime>
 #include <QDebug>
 #include <QDir>
@@ -14,6 +15,11 @@
 #include <QQmlEngine>
 #include <QStandardPaths>
 
+// ponytail: WA_DEBUG=1 traces the job queue; drop once the wedge is understood.
+static bool waDebug() {
+    static const bool on = qEnvironmentVariableIsSet("WA_DEBUG");
+    return on;
+}
 
 WhatsApp::WhatsApp(QQmlEngine *engine, QObject *parent)
     : QObject(parent), m_engine(engine) {
@@ -47,11 +53,10 @@ WhatsApp::WhatsApp(QQmlEngine *engine, QObject *parent)
     m_debounce.setSingleShot(true);
     m_debounce.setInterval(100);  // coalesce sync-write bursts; not felt as latency
     connect(&m_debounce, &QTimer::timeout, this, [this] {
-        // A chats refresh costs ~1s. A running sync writes the DB the whole time,
-        // so the watcher re-arms this timer the moment each refresh lands and the
-        // helper stays pinned at one chats job per second until sync ends. Rate
-        // limit instead: re-arm for the remainder, so the last write still lands.
-        const int cooldown = m_syncActive ? 3000 : 500;
+        // A chats refresh costs ~15ms, so rate-limit only enough that a history
+        // sync writing nonstop doesn't pin the helper. Re-arm for the remainder
+        // so the last write still lands.
+        const int cooldown = 250;
         const int since = m_lastChatsReq.isValid() ? int(m_lastChatsReq.elapsed()) : cooldown;
         if (since < cooldown) {
             m_debounce.start(cooldown - since);
@@ -83,6 +88,13 @@ WhatsApp::WhatsApp(QQmlEngine *engine, QObject *parent)
         if (!m_watcher.files().contains(path) && QFileInfo::exists(path))
             m_watcher.addPath(path);
     });
+
+    // Reads are only acked while the window is active (see ackChat). Coming
+    // back does not ack the chat left open: its badge shows until the user
+    // clicks into it again.
+    if (waDebug())
+        connect(qGuiApp, &QGuiApplication::applicationStateChanged, this,
+                [](Qt::ApplicationState st) { qWarning().noquote() << "[wa] app state" << st; });
 
     refreshStatus();
     // Refresh cached profile pictures at most once a day; helper no-ops when fresh.
@@ -131,12 +143,6 @@ bool WhatsApp::busySyncError(const QString &error) {
     return low.contains(QLatin1String("busy syncing"))
         || low.contains(QLatin1String("store is locked"))
         || low.contains(QLatin1String("another wacli"));
-}
-
-// ponytail: WA_DEBUG=1 traces the job queue; drop once the wedge is understood.
-static bool waDebug() {
-    static const bool on = qEnvironmentVariableIsSet("WA_DEBUG");
-    return on;
 }
 
 QString WhatsApp::jobArg(const Job &job, const QString &flag) {
@@ -765,6 +771,13 @@ void WhatsApp::ackChat(const QString &jid, bool force) {
     }
     if (!force && ts <= m_acks.value(jid).toLongLong())
         return;
+    // Never tell WhatsApp we read something while the window is hidden or
+    // unfocused; the user acks by clicking the chat when they come back.
+    if (!force && qGuiApp->applicationState() != Qt::ApplicationActive) {
+        if (waDebug())
+            qWarning().noquote() << "[wa] ack skipped, window inactive";
+        return;
+    }
     m_acks.insert(jid, ts);
     emit acksChanged();
     m_unreadBadge = badgeCount(m_chats, m_acks);

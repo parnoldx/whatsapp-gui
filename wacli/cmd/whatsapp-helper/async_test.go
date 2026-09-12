@@ -154,3 +154,56 @@ func TestRefreshAvatarsSkipsWhileSyncRuns(t *testing.T) {
 		t.Fatal("fetched avatars while sync was running")
 	}
 }
+
+// mark-read must answer from the local ack at once; a failed WhatsApp round
+// trip rolls the ack back and pushes the corrected map.
+func TestMarkReadAnswersBeforeWacliAndPushesRollback(t *testing.T) {
+	resetLidMap()
+	f := newFixture(t)
+	pushes := make(chan map[string]any, 4)
+	outMu.Lock()
+	outLine = func(payload map[string]any) { pushes <- payload }
+	outMu.Unlock()
+	defer func() { outMu.Lock(); outLine = nil; outMu.Unlock() }()
+
+	release := make(chan struct{})
+	saved := runWacliFn
+	runWacliFn = func(args []string, opts wacliOpts) (map[string]any, *helperError) {
+		<-release
+		return nil, fail("store is locked")
+	}
+	defer func() { runWacliFn = saved }()
+
+	done := make(chan map[string]any, 1)
+	go func() {
+		data, he := cmdMarkRead(f.store, "111@s.whatsapp.net", 0)
+		if he != nil {
+			t.Error(he)
+		}
+		done <- data
+	}()
+	select {
+	case data := <-done:
+		if acks, _ := data["acks"].(map[string]int64); acks["111@s.whatsapp.net"] != 100 {
+			t.Fatalf("acks = %v, want chat acked at 100", data["acks"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cmdMarkRead blocked on the wacli round trip")
+	}
+	close(release)
+	select {
+	case p := <-pushes:
+		if p["push"] != "mark-read" {
+			t.Fatalf("push kind = %v", p["push"])
+		}
+		acks, _ := p["data"].(map[string]any)["acks"].(map[string]int64)
+		if acks["111@s.whatsapp.net"] != 0 {
+			t.Errorf("pushed ack = %d, want rolled back to 0", acks["111@s.whatsapp.net"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no rollback push")
+	}
+	if got := loadPrefs().Acks["111@s.whatsapp.net"]; got != 0 {
+		t.Errorf("ack on disk = %d, want 0", got)
+	}
+}

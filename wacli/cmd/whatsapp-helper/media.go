@@ -551,7 +551,13 @@ func cmdStatus(store string) (map[string]any, *helperError) {
 	}, nil
 }
 
+// prefsMu serializes prefs.json read-modify-write: the daemon loop and the
+// background mark-read goroutine both ack.
+var prefsMu sync.Mutex
+
 func cmdAck(jid string, ts int64) map[string]any {
+	prefsMu.Lock()
+	defer prefsMu.Unlock()
 	prefs := loadPrefs()
 	acks := map[string]int64{}
 	for k, v := range prefs.Acks {
@@ -564,6 +570,8 @@ func cmdAck(jid string, ts int64) map[string]any {
 }
 
 func cmdReceipts(enabled bool) map[string]any {
+	prefsMu.Lock()
+	defer prefsMu.Unlock()
 	prefs := loadPrefs()
 	prefs.Receipts = enabled
 	savePrefs(prefs)
@@ -585,11 +593,36 @@ func cmdMarkRead(store, jid string, ts int64) (map[string]any, *helperError) {
 	}
 	prev := loadPrefs().Acks[jid]
 	result := cmdAck(jid, ts) // persist locally first, before the wacli round-trip
-	if _, he := runWacliFn([]string{"chats", "mark-read", "--chat", jid},
-		wacliOpts{store: store, timeout: 30 * time.Second, lockWait: "0s"}); he != nil {
-		cmdAck(jid, prev) // otherwise the ack sticks and the chat never retries
-		return nil, he
+	tell := func() *helperError {
+		_, he := runWacliFn([]string{"chats", "mark-read", "--chat", jid},
+			wacliOpts{store: store, timeout: 30 * time.Second, lockWait: "0s"})
+		if he != nil {
+			// Otherwise the ack sticks and the chat never retries. Only roll back
+			// our own value: a newer ack for the same chat may have landed since.
+			prefsMu.Lock()
+			if loadPrefs().Acks[jid] == ts {
+				prefsMu.Unlock()
+				cmdAck(jid, prev)
+			} else {
+				prefsMu.Unlock()
+			}
+		}
+		return he
 	}
+	if !pushable() {
+		if he := tell(); he != nil {
+			return nil, he
+		}
+		return result, nil
+	}
+	// Daemon: the WhatsApp round trip takes ~1.5s (30s when offline) and would
+	// hold every chats/messages refresh behind it. Answer with the local ack now;
+	// a failure pushes the rolled-back acks so the badge comes back.
+	go func() {
+		if tell() != nil {
+			push("mark-read", map[string]any{"acks": loadPrefs().Acks})
+		}
+	}()
 	return result, nil
 }
 

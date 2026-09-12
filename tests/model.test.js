@@ -45,10 +45,10 @@ test("badgeCount ignores muted chats and acknowledged timestamps", () => {
   assert.equal(Model.badgeCount(chats, { a: 10 }), 0)
 })
 
-test("visibleUnread hides the count for the open chat and after ack", () => {
+test("visibleUnread hides the count only after ack, even for the open chat", () => {
   const chat = { jid: "a", lastMessageTs: 10, unreadCount: 31 }
   assert.equal(Model.visibleUnread(chat, {}, ""), 31)
-  assert.equal(Model.visibleUnread(chat, {}, "a"), 0)
+  assert.equal(Model.visibleUnread(chat, {}, "a"), 31)
   assert.equal(Model.visibleUnread(chat, { a: 10 }, ""), 0)
 })
 

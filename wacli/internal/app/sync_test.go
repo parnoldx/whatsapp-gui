@@ -896,6 +896,40 @@ func TestChatStateEventsUpdateLocalStore(t *testing.T) {
 	}
 }
 
+// A replayed read mark older than the chat's newest message must not clear
+// the unread state; a current one must.
+func TestStaleReadMarkKeepsChatUnread(t *testing.T) {
+	a := newTestApp(t)
+	a.wa = newFakeWA()
+	chat := types.JID{User: "456", Server: types.DefaultUserServer}
+	last := time.Unix(2000, 0)
+	if err := a.db.UpsertChat(chat.String(), "dm", "Bob", last); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	if err := a.db.SetChatUnreadCount(chat.String(), 3); err != nil {
+		t.Fatalf("SetChatUnreadCount: %v", err)
+	}
+	mark := func(upTo int64) {
+		a.handleChatStateEvent(context.Background(), &events.MarkChatAsRead{
+			JID:          chat,
+			Timestamp:    time.Unix(upTo, 0),
+			FromFullSync: true,
+			Action: &waSyncAction.MarkChatAsReadAction{
+				Read:         proto.Bool(true),
+				MessageRange: &waSyncAction.SyncActionMessageRange{LastMessageTimestamp: proto.Int64(upTo)},
+			},
+		})
+	}
+	mark(1000)
+	if c, _ := a.db.GetChat(chat.String()); !c.Unread || c.UnreadCount != 3 {
+		t.Fatalf("stale read mark cleared unread: %+v", c)
+	}
+	mark(2000)
+	if c, _ := a.db.GetChat(chat.String()); c.Unread || c.UnreadCount != 0 {
+		t.Fatalf("current read mark left chat unread: %+v", c)
+	}
+}
+
 func TestChatStatePersistenceHandlerCoversOtherCollectionDuringWrite(t *testing.T) {
 	a := newTestApp(t)
 	f := newFakeWA()

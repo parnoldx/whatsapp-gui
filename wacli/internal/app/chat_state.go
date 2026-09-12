@@ -485,6 +485,9 @@ func (a *App) handleChatStateEvent(ctx context.Context, evt interface{}) error {
 			return nil
 		}
 		chat := a.canonicalStoreJID(ctx, v.JID)
+		if v.Action.GetRead() && a.readMarkIsStale(canonicalJIDString(chat), v) {
+			return nil
+		}
 		if err := a.db.SetChatUnread(canonicalJIDString(chat), !v.Action.GetRead()); err != nil {
 			a.emitChatStateWarning("mark_read", v.JID, err)
 			return err
@@ -523,4 +526,23 @@ func (a *App) emitChatStateWarning(kind string, jid types.JID, err error) {
 		fmt.Sprintf("warning: failed to store %s chat state for %s: %v", kind, jid, err),
 		map[string]any{"kind": kind, "jid": jid.String(), "error": err.Error()},
 	)
+}
+
+// readMarkIsStale reports whether a "read" mark predates the chat's newest
+// message. A full app state resync replays every historical read mark from
+// the phone; applying those blindly cleared every chat's unread state each
+// time any single chat was marked read.
+func (a *App) readMarkIsStale(jid string, v *events.MarkChatAsRead) bool {
+	upTo := v.Action.GetMessageRange().GetLastMessageTimestamp()
+	if upTo <= 0 {
+		upTo = v.Timestamp.Unix()
+	}
+	if upTo <= 0 {
+		return false
+	}
+	c, err := a.db.GetChat(jid)
+	if err != nil {
+		return false
+	}
+	return c.LastMessageTS.Unix() > upTo
 }
