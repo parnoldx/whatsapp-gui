@@ -106,3 +106,51 @@ func TestDownloadPushesInsteadOfBlocking(t *testing.T) {
 		t.Fatal("finished download was never pushed")
 	}
 }
+
+// The daily refresh must skip avatars already on disk — re-fetching all of them
+// keeps wacli-sync stopped for as long as the walk takes.
+func TestFetchAvatarSkipsCachedFile(t *testing.T) {
+	t.Setenv("PA_WHATSAPP_STATE", t.TempDir())
+	jid := "491234567890@s.whatsapp.net"
+	if err := os.WriteFile(avatarFile(jid), []byte("\xff\xd8\xff\xd9"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	saved := runWacliFn
+	runWacliFn = func(args []string, opts wacliOpts) (map[string]any, *helperError) {
+		called = true
+		return map[string]any{}, nil
+	}
+	defer func() { runWacliFn = saved }()
+	fetchAvatar("", jid)
+	if called {
+		t.Fatal("refetched an avatar that was already cached")
+	}
+}
+
+// Avatars must never cost a sync restart: WhatsApp replays the offline backlog
+// on reconnect and it is acked whether or not it lands in the store.
+func TestRefreshAvatarsSkipsWhileSyncRuns(t *testing.T) {
+	f := newFixture(t)
+	saved := syncActiveFn
+	syncActiveFn = func() bool { return true }
+	defer func() { syncActiveFn = saved }()
+	called := false
+	savedRun := runWacliFn
+	runWacliFn = func(args []string, opts wacliOpts) (map[string]any, *helperError) {
+		called = true
+		return map[string]any{}, nil
+	}
+	defer func() { runWacliFn = savedRun }()
+
+	data, he := cmdRefreshAvatars(f.store)
+	if he != nil {
+		t.Fatal(he)
+	}
+	if data["skipped"] != true {
+		t.Fatalf("expected a skip while sync runs, got %v", data)
+	}
+	if called {
+		t.Fatal("fetched avatars while sync was running")
+	}
+}

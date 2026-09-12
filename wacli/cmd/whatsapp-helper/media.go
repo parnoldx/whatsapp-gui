@@ -697,6 +697,9 @@ func cmdAvatar(store, jid string) (map[string]any, *helperError) {
 // fetchAvatar does the slow half: ask WhatsApp for the picture and cache it.
 // Blocking, so only the background goroutine above and the daily refresh call it.
 func fetchAvatar(store, jid string) {
+	if cachedAvatarURL(jid) != "" {
+		return // already on disk; the daily refresh only fills gaps
+	}
 	avatarMu.Lock()
 	index := loadAvatarIndex()
 	avatarMu.Unlock()
@@ -742,24 +745,33 @@ func markAvatar(jid string, entry map[string]any) {
 	saveAvatarIndex(index)
 }
 
+// refreshBudget bounds one bulk pass so a cold cache cannot grind for an hour.
+const refreshBudget = 30 * time.Second
+
 func cmdRefreshAvatars(store string) (map[string]any, *helperError) {
-	// picture-info needs the store lock, which a running wacli-sync daemon
-	// holds permanently — so pause sync, fetch every chat's avatar, resume.
-	// Rate-limited to one run per day via marker file; the GUI calls this on
-	// startup, no-op when fresh.
+	// picture-info needs the store lock, which a running wacli-sync daemon holds
+	// permanently. Taking it means stopping sync — and every sync restart makes
+	// WhatsApp replay the offline backlog, which is acked whether or not it gets
+	// stored. That has already cost real messages. Avatars are cosmetic; the
+	// message pipeline is not. So: fill the cache only when sync is already off,
+	// never by stopping it.
+	if syncActiveFn() {
+		return map[string]any{"skipped": true, "reason": "sync running"}, nil
+	}
 	marker := filepath.Join(stateDir(), ".avatars-refresh")
 	if st, err := os.Stat(marker); err == nil && now()-st.ModTime().Unix() < 86400 {
 		return map[string]any{"skipped": true}, nil
 	}
-	wasRunning := syncActive()
-	if wasRunning {
-		_ = exec.Command("systemctl", "--user", "stop", "wacli-sync").Run()
+	// The GUI spawns this detached, so a relaunch can overlap the previous run.
+	lock := filepath.Join(stateDir(), ".avatars-refresh.lock")
+	if st, err := os.Stat(lock); err == nil && time.Since(st.ModTime()) < 10*time.Minute {
+		return map[string]any{"skipped": true}, nil
 	}
-	defer func() {
-		if wasRunning {
-			_ = exec.Command("systemctl", "--user", "start", "wacli-sync").Run()
-		}
-	}()
+	if f, err := os.OpenFile(lock, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600); err == nil {
+		f.Close()
+	}
+	defer os.Remove(lock)
+
 	avatarMu.Lock()
 	index := loadAvatarIndex()
 	for _, entry := range index {
@@ -769,18 +781,29 @@ func cmdRefreshAvatars(store string) (map[string]any, *helperError) {
 	}
 	saveAvatarIndex(index)
 	avatarMu.Unlock()
+
 	chats, _ := listChats(store, "", maxChats, false)
+	deadline := time.Now().Add(refreshBudget)
+	done := 0
 	for _, c := range chats {
+		// Sync can come back mid-pass (the GUI has a toggle); yield the lock.
+		if time.Now().After(deadline) || syncActiveFn() {
+			break
+		}
 		jid, _ := c["jid"].(string)
 		if jid != "" {
 			fetchAvatar(store, jid)
+			done++
 		}
 	}
-	f, err := os.OpenFile(marker, os.O_CREATE|os.O_WRONLY, 0o600)
-	if err == nil {
-		f.Close()
+	complete := done >= len(chats)
+	if complete {
+		// Incomplete runs leave the marker alone so the next launch continues.
+		if f, err := os.OpenFile(marker, os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
+			f.Close()
+		}
 	}
-	return map[string]any{"refreshed": true}, nil
+	return map[string]any{"refreshed": done, "complete": complete}, nil
 }
 
 // --- media prune ---
