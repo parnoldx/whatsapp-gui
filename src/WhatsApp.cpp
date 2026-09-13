@@ -5,6 +5,7 @@
 
 #include <QCoreApplication>
 #include <QGuiApplication>
+#include <QClipboard>
 #include <QDateTime>
 #include <QDebug>
 #include <QDir>
@@ -1089,6 +1090,26 @@ void WhatsApp::pickEmoji(QJSValue done) {
 
 void WhatsApp::clipboard(QJSValue done) {
     call({QStringLiteral("clipboard")}, QString(), done);
+}
+
+void WhatsApp::copyText(const QString &text) {
+    if (text.isEmpty())
+        return;
+    // Composer paste reads via wl-paste; keep that path in lockstep.
+    auto *p = new QProcess(this);
+    const QByteArray bytes = text.toUtf8();
+    connect(p, &QProcess::started, this, [p, bytes]() {
+        p->write(bytes);
+        p->closeWriteChannel();
+    });
+    connect(p, &QProcess::finished, p, &QObject::deleteLater);
+    connect(p, &QProcess::errorOccurred, this, [p, text](QProcess::ProcessError e) {
+        if (e != QProcess::FailedToStart)
+            return;
+        QGuiApplication::clipboard()->setText(text);
+        p->deleteLater();
+    });
+    p->start(QStringLiteral("wl-copy"), {QStringLiteral("--type"), QStringLiteral("text/plain")});
 }
 
 void WhatsApp::openFile(const QString &path) {

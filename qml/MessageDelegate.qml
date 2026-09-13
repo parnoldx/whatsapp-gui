@@ -20,7 +20,17 @@ Item {
     property bool unreadMark: false
     property bool reactOpen: false
     readonly property string messageId: (message && message.id) ? message.id : ""
-    onMessageIdChanged: reactOpen = false
+    onMessageIdChanged: {
+        reactOpen = false
+        body.deselect()
+    }
+
+    function copyMessageText() {
+        var selected = body.visible ? body.selectedText : ""
+        var text = selected || Model.copyableText(root.message)
+        if (text)
+            WhatsApp.copyText(text)
+    }
 
     readonly property bool fromMe: message && message.fromMe === true
     readonly property string kind: message && message.kind ? message.kind : "text"
@@ -370,18 +380,46 @@ Item {
                     font.pixelSize: 12
                 }
 
-                Text {
+                TextEdit {
+                    id: body
                     visible: !!(linked.plain) && !urlOnly
                     width: parent.width
-                    wrapMode: Text.Wrap
-                    textFormat: linked.hasLinks ? Text.StyledText : Text.PlainText
+                    height: contentHeight
+                    readOnly: true
+                    selectByMouse: true
+                    selectByKeyboard: true
+                    persistentSelection: true
+                    cursorVisible: false
+                    textMargin: 0
+                    wrapMode: TextEdit.Wrap
+                    textFormat: linked.hasLinks ? TextEdit.RichText : TextEdit.PlainText
                     text: linked.hasLinks ? linked.html : linked.plain
                     color: Theme.textPrimary
+                    selectionColor: Theme.selection
+                    selectedTextColor: Theme.onAccent
                     font.family: Theme.fontFamily
                     font.pixelSize: 13
                     onLinkActivated: function(link) {
                         var parsed = Model.parseLink(link)
                         root.openLink(parsed && parsed.url ? parsed : { url: link }, false)
+                    }
+                    Keys.onPressed: function(event) {
+                        if (!event.matches(StandardKey.Copy))
+                            return
+                        var t = selectedText || Model.copyableText(root.message)
+                        if (!t)
+                            return
+                        event.accepted = true
+                        WhatsApp.copyText(t)
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        enabled: !(message && message.pollId)
+                        acceptedButtons: Qt.LeftButton
+                        preventStealing: true
+                        propagateComposedEvents: true
+                        cursorShape: Qt.IBeamCursor
+                        onPressed: function(mouse) { mouse.accepted = false }
                     }
                     // Poll votes carry the poll they belong to: tap to jump to it.
                     MouseArea {
@@ -621,6 +659,11 @@ Item {
                 MenuItem {
                     text: "Reply"
                     onTriggered: root.reply(root.message)
+                }
+                MenuItem {
+                    text: "Copy"
+                    enabled: !!(body.selectedText || Model.copyableText(root.message))
+                    onTriggered: root.copyMessageText()
                 }
                 MenuItem {
                     text: "Remove reaction"

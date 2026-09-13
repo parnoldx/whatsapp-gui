@@ -19,6 +19,17 @@ test("linkify escapes html and wraps urls", () => {
   assert.match(linked.html, /&lt;script&gt;/)
 })
 
+test("copyableText prefers body text then caption then location", () => {
+  assert.equal(Model.copyableText({ text: "hi" }), "hi")
+  assert.equal(Model.copyableText({ caption: "cap" }), "cap")
+  assert.equal(Model.copyableText({ text: "hi", caption: "cap" }), "hi")
+  assert.equal(Model.copyableText({
+    kind: "location", locationName: "Cafe", locationAddress: "1 Main"
+  }), "Cafe\n1 Main")
+  assert.equal(Model.copyableText({ kind: "image" }), "")
+  assert.equal(Model.copyableText(null), "")
+})
+
 test("filterChats matches name or preview", () => {
   const chats = [
     { name: "Ada", preview: "hello" },

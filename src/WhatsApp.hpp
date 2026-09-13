@@ -88,6 +88,7 @@ public:
     Q_INVOKABLE void openEmojiPicker();
     Q_INVOKABLE void pickEmoji(QJSValue done);
     Q_INVOKABLE void clipboard(QJSValue done);
+    Q_INVOKABLE void copyText(const QString &text);
     Q_INVOKABLE void openFile(const QString &path);
     Q_INVOKABLE void voicePath(QJSValue done);
     Q_INVOKABLE QVariantMap draftFor(const QString &jid) const;

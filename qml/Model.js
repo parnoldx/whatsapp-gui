@@ -65,6 +65,18 @@ function linkify(text) {
   return { html: html.replace(/\n/g, "<br/>"), hasLinks: html.indexOf("<a href=") !== -1, plain: raw }
 }
 
+function copyableText(m) {
+  if (!m) return ""
+  var t = String(m.text || m.caption || "")
+  if (t) return t
+  if (String(m.kind || "") === "location") {
+    var name = String(m.locationName || "Location")
+    var addr = String(m.locationAddress || "")
+    return addr ? (name + "\n" + addr) : name
+  }
+  return ""
+}
+
 function asList(value) {
   if (!value) return []
   if (Array.isArray(value)) return value
@@ -605,6 +617,7 @@ if (typeof module !== "undefined" && module.exports) {
     formatDay: formatDay,
     escapeHtml: escapeHtml,
     linkify: linkify,
+    copyableText: copyableText,
     filterChats: filterChats,
     visibleUnread: visibleUnread,
     badgeCount: badgeCount,
