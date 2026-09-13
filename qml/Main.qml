@@ -888,7 +888,9 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 Text {
                     Layout.fillWidth: true
-                    text: win.viewer ? (win.viewer.filename || win.viewer.kind) : ""
+                    Layout.minimumWidth: 0
+                    elide: Text.ElideMiddle
+                    text: Model.viewerTitle(win.viewer)
                     textFormat: Text.PlainText
                     color: "#ffffff"
                 }

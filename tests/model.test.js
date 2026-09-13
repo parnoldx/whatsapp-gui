@@ -212,6 +212,29 @@ test("fileKind guesses from the path", () => {
   assert.equal(Model.fileKind("x.pdf"), "document")
 })
 
+test("generatedFilename hides hashes and WhatsApp camera names", () => {
+  assert.equal(Model.generatedFilename("a42a8e0a906914d08578add805ed315c8361f9523a970b276f83c3092cab23ca.jpg"), true)
+  assert.equal(Model.generatedFilename("IMG-20260913-WA0001.jpg"), true)
+  assert.equal(Model.generatedFilename("VID-20260913-WA0002.mp4"), true)
+  assert.equal(Model.generatedFilename("image.jpg"), true)
+  assert.equal(Model.generatedFilename("message-3EB0ABC.jpg"), true)
+  assert.equal(Model.generatedFilename("vacation-italy.jpg"), false)
+  assert.equal(Model.generatedFilename("screenshot-2026-09-13_11-39-24.png"), false)
+  assert.equal(Model.generatedFilename("invoice.pdf"), false)
+})
+
+test("viewerTitle skips generated names on photos", () => {
+  assert.equal(Model.viewerTitle({
+    kind: "image",
+    filename: "a42a8e0a906914d08578add805ed315c8361f9523a970b276f83c3092cab23ca.jpg"
+  }), "")
+  assert.equal(Model.viewerTitle({ kind: "image", filename: "holiday.png" }), "holiday.png")
+  assert.equal(Model.viewerTitle({ kind: "document", filename: "invoice.pdf" }), "invoice.pdf")
+  assert.equal(Model.viewerTitle({ kind: "document", filename: "image.jpg" }), "Document")
+  assert.equal(Model.viewerTitle({ kind: "embed", filename: "A video" }), "A video")
+  assert.equal(Model.viewerTitle({ kind: "voice", filename: "PTT-20260913-WA0001.ogg" }), "Voice note")
+})
+
 test("overlayPendingSends shows a bubble until the real row lands", () => {
   const pending = [Model.pendingMessage({
     id: "pending:1", chatJid: "a", ts: 100, kind: "text", text: "hi"

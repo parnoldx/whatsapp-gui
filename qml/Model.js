@@ -464,6 +464,30 @@ function fileKind(path) {
   return "document"
 }
 
+// WhatsApp photos/videos usually land as a media hash or IMG-…-WA0001.
+function generatedFilename(name) {
+  var base = String(name || "").split(/[\\/]/).pop().trim()
+  if (!base) return true
+  var stem = base.replace(/\.[^.]+$/, "")
+  if (!stem) return true
+  if (/^[0-9a-f]{32,}$/i.test(stem)) return true
+  if (/^(IMG|VID|AUD|PTT|STK|DOC)-\d{8}-WA\d+/i.test(stem)) return true
+  if (/^message-.+/i.test(stem)) return true
+  if (/^(image|photo|picture|video|sticker|audio|voice|file|document)$/i.test(stem)) return true
+  return false
+}
+
+function viewerTitle(viewer) {
+  if (!viewer) return ""
+  var kind = String(viewer.kind || "")
+  var name = String(viewer.filename || "").trim()
+  if (kind === "embed") return name || "Link"
+  var real = name && !generatedFilename(name) ? name : ""
+  if (kind === "image" || kind === "gif" || kind === "sticker" || kind === "video")
+    return real
+  return real || kindLabel(kind) || name
+}
+
 var pendingSeq = 0
 
 function pendingMessage(fields) {
@@ -604,6 +628,8 @@ if (typeof module !== "undefined" && module.exports) {
     filterMembers: filterMembers,
     kindLabel: kindLabel,
     fileKind: fileKind,
+    generatedFilename: generatedFilename,
+    viewerTitle: viewerTitle,
     pendingMessage: pendingMessage,
     sameSend: sameSend,
     overlayPendingSends: overlayPendingSends
