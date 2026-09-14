@@ -23,6 +23,7 @@ type Media struct {
 	FileSHA256    []byte
 	FileEncSHA256 []byte
 	FileLength    uint64
+	Thumbnail     []byte
 }
 
 type Location struct {

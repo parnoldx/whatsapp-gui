@@ -57,6 +57,10 @@ CREATE TABLE message_locations (
   chat_jid TEXT, msg_id TEXT, latitude REAL, longitude REAL,
   name TEXT, address TEXT, is_live INTEGER
 );
+CREATE TABLE message_thumbnails (
+  chat_jid TEXT, msg_id TEXT, jpeg BLOB,
+  PRIMARY KEY (chat_jid, msg_id)
+);
 `
 
 const insertMsg = `INSERT INTO messages (
@@ -1497,6 +1501,117 @@ func TestVideoThumbIsFirstFrame(t *testing.T) {
 	local := result["localPath"].(string)
 	if _, err := os.Stat(strings.TrimSuffix(local, filepath.Ext(local)) + ".jpg"); err != nil {
 		t.Errorf("thumb: %v", err)
+	}
+}
+
+func TestGifGetsAVideoThumb(t *testing.T) {
+	resetLidMap()
+	f := newFixture(t)
+	mp4 := t.TempDir() + "/loop.mp4"
+	if err := tinyMP4(t, mp4); err != nil {
+		t.Skip("ffmpeg cannot encode a test clip")
+	}
+	con := openrw(t, f.db)
+	mustExec(t, con, insertMsg, []any{
+		"111@s.whatsapp.net", "Ada", "gif1", "111@s.whatsapp.net", "Ada", 142, 1,
+		"", "Sent gif", "", "", 0, 0, "", "", "gif", "", "", "video/mp4",
+		fileSize(t, mp4), mp4, 1, 0, 0, 0, 0, "",
+	})
+	con.Close()
+	messages, err := listMessages(f.store, "111@s.whatsapp.net", 80, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gif map[string]any
+	for _, m := range messages {
+		if m["id"] == "gif1" {
+			gif = m
+			break
+		}
+	}
+	if gif == nil {
+		t.Fatal("gif1 missing")
+	}
+	if gif["kind"] != "gif" {
+		t.Errorf("kind = %v", gif["kind"])
+	}
+	thumb, _ := gif["thumbUrl"].(string)
+	if !strings.HasPrefix(thumb, "file:") {
+		t.Errorf("thumbUrl = %v", gif["thumbUrl"])
+	}
+
+	blob := readBytes(t, mp4)
+	saved := runWacliFn
+	runWacliFn = func(args []string, opts wacliOpts) (map[string]any, *helperError) {
+		for i, a := range args {
+			if a == "--output" {
+				if err := os.WriteFile(args[i+1], blob, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		return map[string]any{}, nil
+	}
+	defer func() { runWacliFn = saved }()
+	con = openrw(t, f.db)
+	mustExec(t, con, insertMsg, []any{
+		"111@s.whatsapp.net", "Ada", "gif2", "111@s.whatsapp.net", "Ada", 143, 1,
+		"", "Sent gif", "", "", 0, 0, "", "", "gif", "", "", "video/mp4",
+		len(blob), "", 0, 0, 0, 0, 0, "",
+	})
+	con.Close()
+	result, err := downloadMedia(f.store, "111@s.whatsapp.net", "gif2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["kind"] != "gif" {
+		t.Errorf("kind = %v", result["kind"])
+	}
+	if thumb, _ := result["thumbUrl"].(string); !strings.HasPrefix(thumb, "file:") {
+		t.Errorf("download thumbUrl = %v", result["thumbUrl"])
+	}
+}
+
+func TestUndownloadedVideoUsesProtoThumbnail(t *testing.T) {
+	resetLidMap()
+	f := newFixture(t)
+	jpeg := bytes.Repeat([]byte{0x00}, 40)
+	jpeg[0], jpeg[1] = 0xff, 0xd8
+	con := openrw(t, f.db)
+	mustExec(t, con, insertMsg, []any{
+		"111@s.whatsapp.net", "Ada", "vid3", "111@s.whatsapp.net", "Ada", 144, 0,
+		"", "Sent video", "", "", 0, 0, "", "", "video", "", "clip.mp4", "video/mp4",
+		99, "", 0, 0, 0, 0, 0, "",
+	})
+	mustExec(t, con, `INSERT INTO message_thumbnails(chat_jid, msg_id, jpeg) VALUES(?,?,?)`, []any{
+		"111@s.whatsapp.net", "vid3", jpeg,
+	})
+	con.Close()
+	messages, err := listMessages(f.store, "111@s.whatsapp.net", 80, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vid map[string]any
+	for _, m := range messages {
+		if m["id"] == "vid3" {
+			vid = m
+			break
+		}
+	}
+	if vid == nil {
+		t.Fatal("vid3 missing")
+	}
+	if vid["downloaded"] != false {
+		t.Errorf("downloaded = %v", vid["downloaded"])
+	}
+	thumb, _ := vid["thumbUrl"].(string)
+	if !strings.HasPrefix(thumb, "file:") {
+		t.Fatalf("thumbUrl = %v", vid["thumbUrl"])
+	}
+	path := strings.TrimPrefix(thumb, "file://")
+	data, readErr := os.ReadFile(path)
+	if readErr != nil || !bytes.HasPrefix(data, []byte{0xff, 0xd8}) {
+		t.Errorf("proto thumb file: %v", readErr)
 	}
 }
 

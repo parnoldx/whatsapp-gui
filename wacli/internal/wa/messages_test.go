@@ -1,6 +1,7 @@
 package wa
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
@@ -301,6 +302,42 @@ func TestParseLiveMessageImageClonesBytes(t *testing.T) {
 	key[0] = 9
 	if pm.Media.MediaKey[0] == 9 {
 		t.Fatalf("expected MediaKey to be cloned")
+	}
+}
+
+func TestParseLiveMessageVideoKeepsJPEGThumbnail(t *testing.T) {
+	chat, _ := types.ParseJID("123@s.whatsapp.net")
+	sender, _ := types.ParseJID("sender@s.whatsapp.net")
+	thumb := bytes.Repeat([]byte{0x00}, 32)
+	thumb[0], thumb[1] = 0xff, 0xd8
+	vid := &waProto.VideoMessage{
+		Mimetype:      proto.String("video/mp4"),
+		DirectPath:    proto.String("/direct"),
+		JPEGThumbnail: thumb,
+		FileLength:    proto.Uint64(99),
+	}
+	ev := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chat,
+				Sender:   sender,
+				IsFromMe: false,
+			},
+			ID:        "vid1",
+			Timestamp: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+		Message: &waProto.Message{VideoMessage: vid},
+	}
+	pm := ParseLiveMessage(ev)
+	if pm.Media == nil || pm.Media.Type != "video" {
+		t.Fatalf("parsed = %+v", pm.Media)
+	}
+	if !bytes.Equal(pm.Media.Thumbnail, thumb) {
+		t.Fatalf("thumbnail not kept")
+	}
+	thumb[2] = 0xff
+	if pm.Media.Thumbnail[2] == 0xff {
+		t.Fatal("thumbnail must be cloned")
 	}
 }
 

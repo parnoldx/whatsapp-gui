@@ -307,6 +307,7 @@ func (d *DB) PurgeMessage(chatJID, msgID string) error {
 		`DELETE FROM starred WHERE chat_jid = ? AND msg_id = ?`,
 		`DELETE FROM message_local_media_aliases WHERE chat_jid = ? AND msg_id = ?`,
 		`DELETE FROM message_locations WHERE chat_jid = ? AND msg_id = ?`,
+		`DELETE FROM message_thumbnails WHERE chat_jid = ? AND msg_id = ?`,
 	} {
 		args := []any{chatJID, msgID}
 		if strings.Contains(stmt, "vote_msg_id") {

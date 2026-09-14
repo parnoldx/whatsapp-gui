@@ -534,6 +534,15 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 		return err
 	}
 	a.warnUnhandledPayload(pm)
+	if pm.Media != nil && len(pm.Media.Thumbnail) > 0 {
+		if err := a.db.UpsertMessageThumbnail(store.MessageThumbnail{
+			ChatJID: chatJID,
+			MsgID:   pm.ID,
+			JPEG:    pm.Media.Thumbnail,
+		}); err != nil {
+			return err
+		}
+	}
 	if pm.Location != nil {
 		if err := a.db.UpsertMessageLocation(store.MessageLocation{
 			ChatJID:   chatJID,

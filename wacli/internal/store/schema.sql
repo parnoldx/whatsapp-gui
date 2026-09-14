@@ -108,6 +108,13 @@ CREATE TABLE IF NOT EXISTS message_payload_purges (
     PRIMARY KEY (chat_jid, msg_id)
 );
 
+CREATE TABLE IF NOT EXISTS message_thumbnails (
+    chat_jid TEXT NOT NULL,
+    msg_id TEXT NOT NULL,
+    jpeg BLOB NOT NULL,
+    PRIMARY KEY (chat_jid, msg_id)
+);
+
 CREATE TABLE IF NOT EXISTS message_local_media_aliases (
     chat_jid TEXT NOT NULL,
     msg_id TEXT NOT NULL,

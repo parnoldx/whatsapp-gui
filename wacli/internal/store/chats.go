@@ -257,6 +257,9 @@ func (d *DB) DeleteChatsOlderThan(days int) (int64, error) {
 	if _, err := tx.Exec(`DELETE FROM message_locations WHERE chat_jid IN (`+staleChatJIDsSQL+`)`, cutoffUnix); err != nil {
 		return 0, err
 	}
+	if _, err := tx.Exec(`DELETE FROM message_thumbnails WHERE chat_jid IN (`+staleChatJIDsSQL+`)`, cutoffUnix); err != nil {
+		return 0, err
+	}
 	res, err := tx.Exec(`DELETE FROM chats WHERE jid IN (`+staleChatJIDsSQL+`)`, cutoffUnix)
 	if err != nil {
 		return 0, err

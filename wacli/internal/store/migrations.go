@@ -40,6 +40,7 @@ var schemaMigrations = []migration{
 	{version: 24, name: "app state recovery intents", up: migrateAppStateRecoveryIntents},
 	{version: 25, name: "message locations", up: migrateMessageLocations},
 	{version: 26, name: "message identity indexes and selective fts updates", up: migrateMessageIdentityIndexes},
+	{version: 27, name: "message thumbnails", up: migrateMessageThumbnails},
 }
 
 func migrateMessageIdentityIndexes(d *DB) error {
@@ -54,6 +55,20 @@ func migrateMessageIdentityIndexes(d *DB) error {
 		return fmt.Errorf("create message identity indexes: %w", err)
 	}
 	return migrateMessagesFTS(d)
+}
+
+func migrateMessageThumbnails(d *DB) error {
+	if _, err := d.sql.Exec(`
+		CREATE TABLE IF NOT EXISTS message_thumbnails (
+			chat_jid TEXT NOT NULL,
+			msg_id TEXT NOT NULL,
+			jpeg BLOB NOT NULL,
+			PRIMARY KEY (chat_jid, msg_id)
+		);
+	`); err != nil {
+		return fmt.Errorf("create message_thumbnails table: %w", err)
+	}
+	return nil
 }
 
 func migrateMessageLocations(d *DB) error {

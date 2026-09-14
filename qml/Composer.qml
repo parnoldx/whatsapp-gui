@@ -173,21 +173,31 @@ Item {
                     width: chipText.implicitWidth + 20
                     radius: Theme.radiusSmall
                     color: Theme.cardBg
-                    Text {
-                        id: chipText
+                    RowLayout {
                         anchors.centerIn: parent
-                        text: modelData.name || "file"
-                        textFormat: Text.PlainText
-                        color: Theme.textPrimary
-                        font.pixelSize: 11
-                    }
-                    MouseArea {
-                        anchors.fill: parent
-                        onClicked: {
-                            var next = root.files.slice()
-                            next.splice(index, 1)
-                            root.files = next
-                            root.persist()
+                        spacing: 4
+                        Text {
+                            text: modelData.name || "file"
+                            textFormat: Text.PlainText
+                            color: Theme.textPrimary
+                            font.pixelSize: 11
+                        }
+                        Text {
+                            text: "×"
+                            textFormat: Text.PlainText
+                            color: Theme.textPrimary
+                            font.pixelSize: 11
+                            MouseArea {
+                                anchors.fill: parent
+                                anchors.margins: -4
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    var next = root.files.slice()
+                                    next.splice(index, 1)
+                                    root.files = next
+                                    root.persist()
+                                }
+                            }
                         }
                     }
                 }

@@ -64,6 +64,15 @@ func TestOpenCreatesExpectedSchema(t *testing.T) {
 			t.Fatalf("expected message_locations column %q to exist", want)
 		}
 	}
+	thumbCols, err := tableColumns(db.sql, "message_thumbnails")
+	if err != nil {
+		t.Fatalf("message_thumbnails tableColumns: %v", err)
+	}
+	for _, want := range []string{"chat_jid", "msg_id", "jpeg"} {
+		if !thumbCols[want] {
+			t.Fatalf("expected message_thumbnails column %q to exist", want)
+		}
+	}
 
 	callCols, err := tableColumns(db.sql, "call_events")
 	if err != nil {

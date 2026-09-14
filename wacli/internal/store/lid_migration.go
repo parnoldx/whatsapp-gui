@@ -108,6 +108,9 @@ func (d *DB) MigrateLIDToPN(lidJID, pnJID string) error {
 	if err := migrateLIDMessageLocationsToPN(tx, lidJID, pnJID); err != nil {
 		return err
 	}
+	if err := migrateLIDMessageThumbnailsToPN(tx, lidJID, pnJID); err != nil {
+		return err
+	}
 	if err := migrateLIDPollsToPN(tx, lidJID, pnJID); err != nil {
 		return err
 	}
@@ -496,6 +499,37 @@ func migrateLIDMessageLocationsToPN(tx *sql.Tx, lidJID, pnJID string) error {
 		)
 	`); err != nil {
 		return fmt.Errorf("suppress destination-only purged locations: %w", err)
+	}
+	return nil
+}
+
+func migrateLIDMessageThumbnailsToPN(tx *sql.Tx, lidJID, pnJID string) error {
+	if _, err := tx.Exec(`
+		INSERT INTO message_thumbnails(chat_jid, msg_id, jpeg)
+		SELECT ?, msg_id, jpeg
+		FROM message_thumbnails
+		WHERE chat_jid = ?
+			AND NOT EXISTS (
+				SELECT 1 FROM message_payload_purges p
+				WHERE p.chat_jid IN (?, ?) AND p.msg_id = message_thumbnails.msg_id
+			)
+		ON CONFLICT(chat_jid, msg_id) DO UPDATE SET
+			jpeg = CASE WHEN length(excluded.jpeg) > length(message_thumbnails.jpeg)
+				THEN excluded.jpeg ELSE message_thumbnails.jpeg END
+	`, pnJID, lidJID, lidJID, pnJID); err != nil {
+		return fmt.Errorf("migrate lid message thumbnails: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM message_thumbnails WHERE chat_jid = ?`, lidJID); err != nil {
+		return fmt.Errorf("delete migrated lid message thumbnails: %w", err)
+	}
+	if _, err := tx.Exec(`
+		DELETE FROM message_thumbnails
+		WHERE EXISTS (
+			SELECT 1 FROM message_payload_purges p
+			WHERE p.chat_jid = message_thumbnails.chat_jid AND p.msg_id = message_thumbnails.msg_id
+		)
+	`); err != nil {
+		return fmt.Errorf("suppress destination-only purged thumbnails: %w", err)
 	}
 	return nil
 }

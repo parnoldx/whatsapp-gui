@@ -609,7 +609,12 @@ ApplicationWindow {
         audioOutput: AudioOutput {}
         videoOutput: videoOut
         source: win.viewer && win.viewer.fileUrl ? win.viewer.fileUrl : ""
-        onMediaStatusChanged: if (mediaStatus === MediaPlayer.EndOfMedia) win.closeViewer()
+        loops: win.viewer && win.viewer.kind === "gif" && Model.playsAsVideo(win.viewer) ? MediaPlayer.Infinite : 1
+        onMediaStatusChanged: {
+            if (mediaStatus === MediaPlayer.EndOfMedia
+                && !(win.viewer && win.viewer.kind === "gif" && Model.playsAsVideo(win.viewer)))
+                win.closeViewer()
+        }
     }
 
     ColumnLayout {
@@ -803,7 +808,9 @@ ApplicationWindow {
                                 isGroup: !!(chat && chat.isGroup)
                                 onOpenMedia: function(msg) {
                                     win.viewer = msg
-                                    if (msg.kind === "video" || msg.kind === "voice" || msg.kind === "audio") player.play()
+                                    if (msg.kind === "video" || msg.kind === "voice" || msg.kind === "audio"
+                                        || (msg.kind === "gif" && Model.playsAsVideo(msg)))
+                                        player.play()
                                 }
                                 onDownload: function(msg) {
                                     win.stickToEnd = false
@@ -929,7 +936,7 @@ ApplicationWindow {
                 }
                 AnimatedImage {
                     anchors.fill: parent
-                    visible: win.viewer && win.viewer.kind === "gif"
+                    visible: win.viewer && win.viewer.kind === "gif" && !Model.playsAsVideo(win.viewer)
                     source: win.viewer && win.viewer.fileUrl ? win.viewer.fileUrl : ""
                     fillMode: Image.PreserveAspectFit
                     playing: visible
@@ -937,7 +944,8 @@ ApplicationWindow {
                 VideoOutput {
                     id: videoOut
                     anchors.fill: parent
-                    visible: win.viewer && (win.viewer.kind === "video" || win.viewer.kind === "voice" || win.viewer.kind === "audio")
+                    visible: win.viewer && (win.viewer.kind === "video" || win.viewer.kind === "voice" || win.viewer.kind === "audio"
+                        || (win.viewer.kind === "gif" && Model.playsAsVideo(win.viewer)))
                 }
                 Text {
                     anchors.centerIn: parent

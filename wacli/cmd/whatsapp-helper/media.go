@@ -65,6 +65,35 @@ func videoThumb(local string) string {
 	return ""
 }
 
+func mediaThumbURL(kind, local, protoJPEG string) string {
+	if kind != "video" && kind != "gif" {
+		return ""
+	}
+	if u := fileURLOk(videoThumb(local)); u != "" {
+		return u
+	}
+	return fileURLOk(protoJPEG)
+}
+
+func protoThumbFile(jid, msgID string, jpeg []byte) string {
+	if len(jpeg) < 24 || jpeg[0] != 0xff || jpeg[1] != 0xd8 {
+		return ""
+	}
+	folder := filepath.Join(stateDir(), "thumbs")
+	if err := os.MkdirAll(folder, 0o700); err != nil {
+		return ""
+	}
+	_ = os.Chmod(folder, 0o700)
+	dest := filepath.Join(folder, mediaKey(jid, msgID)+".jpg")
+	if st, err := os.Stat(dest); err == nil && st.Size() == int64(len(jpeg)) {
+		return dest
+	}
+	if err := os.WriteFile(dest, jpeg, 0o600); err != nil {
+		return ""
+	}
+	return dest
+}
+
 func isOggOpus(path string) bool {
 	f, err := os.Open(path)
 	if err != nil {
@@ -424,13 +453,9 @@ func downloadMedia(store, jid, msgID string) (map[string]any, *helperError) {
 	kind := mediaKind(mediaType.String, mimeType.String)
 	local := firstNonEmpty(existingMedia(localPath.String), cachedMedia(jid, msgID))
 	if local != "" {
-		thumb := ""
-		if kind == "video" {
-			thumb = fileURL(videoThumb(local))
-		}
 		return map[string]any{
 			"id": msgID, "localPath": local, "fileUrl": fileURL(local),
-			"thumbUrl": thumb, "mimeType": mimeType.String, "kind": kind,
+			"thumbUrl": mediaThumbURL(kind, local, ""), "mimeType": mimeType.String, "kind": kind,
 			"filename": filename.String,
 		}, nil
 	}
@@ -485,17 +510,13 @@ func fetchMedia(store, jid, msgID, dest, mimeType, kind, filename string) (map[s
 	}
 	_ = os.Chmod(localPath2, 0o600)
 	rememberMedia(jid, msgID, localPath2)
-	thumb := ""
-	if kind == "video" {
-		thumb = fileURL(videoThumb(localPath2))
-	}
 	name := filename
 	if name == "" {
 		name = filepath.Base(localPath2)
 	}
 	return map[string]any{
 		"id": msgID, "localPath": localPath2, "fileUrl": fileURL(localPath2),
-		"thumbUrl": thumb, "mimeType": mimeType, "kind": kind, "filename": name,
+		"thumbUrl": mediaThumbURL(kind, localPath2, ""), "mimeType": mimeType, "kind": kind, "filename": name,
 	}, nil
 }
 

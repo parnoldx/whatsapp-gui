@@ -572,7 +572,10 @@ void WhatsApp::apply(const Job &job, const QVariantMap &data) {
         const qint64 downloadCutoff = QDateTime::currentSecsSinceEpoch() - 7 * 86400;
         auto considerDownload = [&](const QVariantMap &msg) {
             const QString msgId = msg.value(QStringLiteral("id")).toString();
-            if (msg.value(QStringLiteral("kind")).toString() != QLatin1String("image"))
+            const QString kind = msg.value(QStringLiteral("kind")).toString();
+            if (kind != QLatin1String("image")
+                && kind != QLatin1String("sticker")
+                && kind != QLatin1String("gif"))
                 return;
             if (msg.value(QStringLiteral("downloaded")).toBool()
                 || msg.value(QStringLiteral("unavailable")).toBool()

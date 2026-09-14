@@ -52,6 +52,14 @@ func mediaKind(mediaType, mime string) string {
 	return "unknown"
 }
 
+func tableExists(con *sql.DB, name string) bool {
+	var n int
+	if err := con.QueryRow(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&n); err != nil {
+		return false
+	}
+	return n == 1
+}
+
 func openDB(store string) (*sql.DB, *helperError) {
 	path := dbPath(store)
 	if st, err := os.Stat(path); err != nil || st.IsDir() {
@@ -531,6 +539,7 @@ type msgRow struct {
 	senderFull, senderPush, senderBusiness, senderFirst                        string
 	quotedFull, quotedPush, quotedBusiness, quotedFirst                        string
 	pollTarget                                                                 string
+	protoJPEG                                                                  []byte
 }
 
 // pollVoteText is what the parser stores as the body of a PollUpdateMessage.
@@ -556,6 +565,12 @@ func listMessages(store, jid string, limit int, before int64) ([]map[string]any,
 	isGroup := chat.kind == "group"
 	sibs := siblingJIDs(store, jid)
 	self := selfJIDs(store)
+	thumbSelect := "NULL AS proto_thumb"
+	thumbJoin := ""
+	if tableExists(con, "message_thumbnails") {
+		thumbSelect = "th.jpeg AS proto_thumb"
+		thumbJoin = "LEFT JOIN message_thumbnails th ON th.chat_jid = m.chat_jid AND th.msg_id = m.msg_id"
+	}
 
 	query := `
 		SELECT m.msg_id, m.chat_jid, m.ts, m.from_me, m.sender_jid, m.sender_name,
@@ -572,12 +587,13 @@ func listMessages(store, jid string, limit int, before int64) ([]map[string]any,
 		       sc.business_name AS sender_business, sc.first_name AS sender_first,
 		       qc.full_name AS quoted_full, qc.push_name AS quoted_push,
 		       qc.business_name AS quoted_business, qc.first_name AS quoted_first,
-		       pv.poll_msg_id AS poll_target
+		       pv.poll_msg_id AS poll_target, ` + thumbSelect + `
 		FROM messages m
 		LEFT JOIN messages q
 		  ON q.chat_jid = m.chat_jid AND q.msg_id = m.quoted_msg_id
 		LEFT JOIN message_locations loc
 		  ON loc.chat_jid = m.chat_jid AND loc.msg_id = m.msg_id
+		` + thumbJoin + `
 		LEFT JOIN contacts sc ON sc.jid = m.sender_jid
 		LEFT JOIN contacts qc ON qc.jid = COALESCE(NULLIF(q.sender_jid, ''), m.quoted_sender_jid)
 		LEFT JOIN poll_votes pv ON pv.chat_jid = m.chat_jid AND pv.vote_msg_id = m.msg_id
@@ -611,13 +627,14 @@ func listMessages(store, jid string, limit int, before int64) ([]map[string]any,
 			locName, locAddress, senderFull, senderPush, senderBusiness, senderFirst,
 			quotedFull, quotedPush, quotedBusiness, quotedFirst, pollTarget sql.NullString
 		var locLat, locLng sql.NullFloat64
+		var protoJPEG []byte
 		err := rows.Scan(&msgID, &chatJ, &ts, &fromMe, &senderJ, &senderN, &text, &display,
 			&quotedID, &quotedSnd, &isFwd, &edited, &mediaType, &mediaCaption, &filename,
 			&mimeType, &fileLen, &localPath, &downloadedAt, &unavailableAt, &revoked,
 			&quotedText, &quotedDisplay, &quotedSenderName, &quotedMedia, &quotedRealSender,
 			&locName, &locAddress, &locLat, &locLng,
 			&senderFull, &senderPush, &senderBusiness, &senderFirst,
-			&quotedFull, &quotedPush, &quotedBusiness, &quotedFirst, &pollTarget)
+			&quotedFull, &quotedPush, &quotedBusiness, &quotedFirst, &pollTarget, &protoJPEG)
 		if err != nil {
 			continue
 		}
@@ -637,7 +654,7 @@ func listMessages(store, jid string, limit int, before int64) ([]map[string]any,
 			senderBusiness: senderBusiness.String, senderFirst: senderFirst.String,
 			quotedFull: quotedFull.String, quotedPush: quotedPush.String,
 			quotedBusiness: quotedBusiness.String, quotedFirst: quotedFirst.String,
-			pollTarget: pollTarget.String,
+			pollTarget: pollTarget.String, protoJPEG: protoJPEG,
 		}
 		rs = append(rs, r)
 	}
@@ -801,7 +818,7 @@ func listMessages(store, jid string, limit int, before int64) ([]map[string]any,
 			"fileLength":      row.fileLength,
 			"localPath":       local,
 			"fileUrl":         fileURLOk(local),
-			"thumbUrl":        "",
+			"thumbUrl":        mediaThumbURL(kind, local, protoThumbFile(row.chatJID, row.msgID, row.protoJPEG)),
 			"downloaded":      local != "" && fileExists(local),
 			"unavailable":     row.unavailableAt != 0,
 			"reactions":       rowReaxOrEmpty(rowReax),
@@ -819,9 +836,6 @@ func listMessages(store, jid string, limit int, before int64) ([]map[string]any,
 			item["kind"] = kind
 		} else {
 			item["kind"] = "text"
-		}
-		if kind == "video" {
-			item["thumbUrl"] = fileURLOk(videoThumb(local))
 		}
 		for k, v := range extra {
 			item[k] = v

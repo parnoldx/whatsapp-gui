@@ -476,6 +476,18 @@ function fileKind(path) {
   return "document"
 }
 
+// WhatsApp "GIFs" are MP4 with gifPlayback. AnimatedImage cannot decode those.
+function playsAsVideo(m) {
+  var kind = String((m && m.kind) || "")
+  if (kind === "video") return true
+  if (kind !== "gif") return false
+  var mime = String((m && m.mimeType) || "").toLowerCase()
+  if (mime.indexOf("image/") === 0) return false
+  var name = String((m && (m.localPath || m.filename || m.fileUrl)) || "").split("?")[0].toLowerCase()
+  if (/\.(gif|webp|png)$/.test(name)) return false
+  return true
+}
+
 // WhatsApp photos/videos usually land as a media hash or IMG-…-WA0001.
 function generatedFilename(name) {
   var base = String(name || "").split(/[\\/]/).pop().trim()
@@ -502,6 +514,13 @@ function viewerTitle(viewer) {
 
 var pendingSeq = 0
 
+function sendBody(m) {
+  return String((m && (m.text || m.caption)) || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/^\s+|\s+$/g, "")
+}
+
 function pendingMessage(fields) {
   var f = fields || {}
   pendingSeq += 1
@@ -512,8 +531,8 @@ function pendingMessage(fields) {
     fromMe: true,
     senderJid: String(f.senderJid || ""),
     senderName: String(f.senderName || ""),
-    text: String(f.text || ""),
-    caption: String(f.caption || ""),
+    text: sendBody({ text: f.text }),
+    caption: sendBody({ text: f.caption }),
     kind: String(f.kind || "text"),
     quotedId: String(f.quotedId || ""),
     quotedSender: String(f.quotedSender || ""),
@@ -541,11 +560,18 @@ function sameSend(real, pending) {
   if (Number(real.ts || 0) + 5 < Number(pending.ts || 0)) return false
   var realQuote = String(real.quotedId || "")
   var pendingQuote = String(pending.quotedId || "")
-  // First post-send reload often has no quoted_msg_id yet.
-  if (realQuote && pendingQuote && realQuote !== pendingQuote) return false
+  // WhatsApp often stores a different quoted_msg_id than the UI row we replied
+  // to. Only treat that as a different send when both quote previews exist and
+  // disagree. First post-send reload often has no quoted_msg_id yet.
+  if (realQuote && pendingQuote && realQuote !== pendingQuote) {
+    var realQuotedText = String(real.quotedText || "").replace(/^\s+|\s+$/g, "")
+    var pendingQuotedText = String(pending.quotedText || "").replace(/^\s+|\s+$/g, "")
+    if (realQuotedText && pendingQuotedText && realQuotedText !== pendingQuotedText)
+      return false
+  }
   if (String(pending.kind || "text") === "text")
-    return String(real.text || "") === String(pending.text || "")
-  if (String(real.caption || "") !== String(pending.caption || "")) return false
+    return sendBody(real) === sendBody(pending)
+  if (sendBody({ text: real.caption }) !== sendBody({ text: pending.caption })) return false
   if (pending.filename)
     return String(real.filename || "") === String(pending.filename)
   return true
@@ -641,6 +667,7 @@ if (typeof module !== "undefined" && module.exports) {
     filterMembers: filterMembers,
     kindLabel: kindLabel,
     fileKind: fileKind,
+    playsAsVideo: playsAsVideo,
     generatedFilename: generatedFilename,
     viewerTitle: viewerTitle,
     pendingMessage: pendingMessage,

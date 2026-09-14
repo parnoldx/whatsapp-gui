@@ -280,14 +280,15 @@ func cmdClipboard() (map[string]any, *helperError) {
 			out, err = cmd.Output()
 			done <- err
 		}()
+		var pasteErr error
 		select {
-		case <-done:
+		case pasteErr = <-done:
 		case <-time.After(10 * time.Second):
 			_ = cmd.Process.Kill()
 			<-done
 			return nil, fail("clipboard image is empty")
 		}
-		if <-done != nil || len(out) == 0 {
+		if pasteErr != nil || len(out) == 0 {
 			return nil, fail("clipboard image is empty")
 		}
 		if len(out) > maxFile {
@@ -296,7 +297,7 @@ func cmdClipboard() (map[string]any, *helperError) {
 		if err := os.WriteFile(dest, out, 0o600); err != nil {
 			return nil, fail("could not save the clipboard image")
 		}
-		return map[string]any{"kind": "file", "path": dest, "fileUrl": fileURL(dest), "name": fileNameOf(dest)}, nil
+		return map[string]any{"kind": "file", "path": dest, "fileUrl": fileURL(dest), "name": "clipboard" + imageExt[imageType]}, nil
 	}
 	body, err := exec.Command(wl).Output()
 	if err != nil {

@@ -223,6 +223,18 @@ test("fileKind guesses from the path", () => {
   assert.equal(Model.fileKind("x.pdf"), "document")
 })
 
+test("playsAsVideo treats WhatsApp GIFs as looping video, not AnimatedImage", () => {
+  assert.equal(Model.playsAsVideo({ kind: "video" }), true)
+  assert.equal(Model.playsAsVideo({ kind: "gif", mimeType: "video/mp4" }), true)
+  assert.equal(Model.playsAsVideo({ kind: "gif", localPath: "/media/clip.mp4" }), true)
+  assert.equal(Model.playsAsVideo({ kind: "gif" }), true)
+  assert.equal(Model.playsAsVideo({ kind: "gif", mimeType: "image/gif" }), false)
+  assert.equal(Model.playsAsVideo({ kind: "gif", filename: "loop.gif" }), false)
+  assert.equal(Model.playsAsVideo({ kind: "image" }), false)
+  assert.equal(Model.playsAsVideo({ kind: "sticker", mimeType: "image/webp" }), false)
+  assert.equal(Model.playsAsVideo(null), false)
+})
+
 test("generatedFilename hides hashes and WhatsApp camera names", () => {
   assert.equal(Model.generatedFilename("a42a8e0a906914d08578add805ed315c8361f9523a970b276f83c3092cab23ca.jpg"), true)
   assert.equal(Model.generatedFilename("IMG-20260913-WA0001.jpg"), true)
@@ -304,11 +316,38 @@ test("overlayPendingSends keeps the quote on the surviving bubble", () => {
 
   const otherQuote = [{
     id: "real2", chatJid: "g", fromMe: true, kind: "text", text: "mach",
-    ts: 101, quotedId: "someone-else"
+    ts: 101, quotedId: "someone-else", quotedText: "a different quote"
   }]
   const keep = Model.overlayPendingSends(otherQuote, pending, "g")
   assert.equal(keep.messages.length, 2)
   assert.equal(keep.pending.length, 1)
+})
+
+test("overlayPendingSends matches the real row despite trim and quote-id rewrite", () => {
+  const body = "Ihr werdet alle sterben aber ich kann euch beschützen."
+  const pending = [Model.pendingMessage({
+    id: "pending:1", chatJid: "g", ts: 100, kind: "text",
+    text: body,
+    quotedId: "ui-id", quotedSender: "Denis", quotedText: "Gemäß quote"
+  })]
+  pending[0].text = body + "\n"
+  const trimmed = [{
+    id: "real", chatJid: "g", fromMe: true, kind: "text",
+    text: body, ts: 101, quotedId: "ui-id", quotedText: "Gemäß quote"
+  }]
+  const afterTrim = Model.overlayPendingSends(trimmed, pending, "g")
+  assert.equal(afterTrim.messages.length, 1, "trailing newline on the pending body must not duplicate")
+  assert.equal(afterTrim.messages[0].id, "real")
+  assert.equal(afterTrim.pending.length, 0)
+
+  const rewritten = [{
+    id: "real", chatJid: "g", fromMe: true, kind: "text",
+    text: body, ts: 101, quotedId: "wa-rewrote-this", quotedText: "Gemäß quote"
+  }]
+  const afterId = Model.overlayPendingSends(rewritten, pending, "g")
+  assert.equal(afterId.messages.length, 1, "WhatsApp rewriting quoted_msg_id must not leave a pending bubble")
+  assert.equal(afterId.messages[0].id, "real")
+  assert.equal(afterId.pending.length, 0)
 })
 
 test("mentionToken finds @query at the cursor", () => {

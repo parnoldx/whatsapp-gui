@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls.Basic
+import QtMultimedia
 import "Model.js" as Model
 
 Item {
@@ -19,10 +20,35 @@ Item {
     property bool highlighted: false
     property bool unreadMark: false
     property bool reactOpen: false
+    property bool pooled: false
     readonly property string messageId: (message && message.id) ? message.id : ""
     onMessageIdChanged: {
         reactOpen = false
-        body.deselect()
+        if (body)
+            body.deselect()
+    }
+
+    // reuseItems keeps this delegate alive; drop per-row UI that is not rebound.
+    ListView.onPooled: {
+        pooled = true
+        reactOpen = false
+        if (body)
+            body.deselect()
+    }
+    ListView.onReused: pooled = false
+
+    component LoopVideo: Loader {
+        id: loop
+        property var media: ({})
+        property bool crop: false
+        active: !root.pooled && !!(media && media.downloaded && media.kind === "gif" && Model.playsAsVideo(media))
+        sourceComponent: Video {
+            source: loop.media && loop.media.fileUrl ? loop.media.fileUrl : ""
+            autoPlay: true
+            loops: MediaPlayer.Infinite
+            muted: true
+            fillMode: loop.crop ? VideoOutput.PreserveAspectCrop : VideoOutput.PreserveAspectFit
+        }
     }
 
     function copyMessageText() {
@@ -212,18 +238,23 @@ Item {
                             }
                             AnimatedImage {
                                 anchors.fill: parent
-                                visible: modelData.kind === "gif" && modelData.downloaded
+                                visible: modelData.kind === "gif" && modelData.downloaded && !Model.playsAsVideo(modelData)
                                 source: modelData.fileUrl || ""
                                 fillMode: Image.PreserveAspectCrop
-                                playing: true
+                                playing: visible && !root.pooled
                             }
                             Image {
                                 anchors.fill: parent
-                                visible: modelData.kind === "video" && !!(modelData.thumbUrl)
+                                visible: (modelData.kind === "video" || (modelData.kind === "gif" && Model.playsAsVideo(modelData))) && !!(modelData.thumbUrl)
                                 source: modelData.thumbUrl || ""
                                 fillMode: Image.PreserveAspectCrop
                                 asynchronous: true
                                 cache: true
+                            }
+                            LoopVideo {
+                                anchors.fill: parent
+                                media: modelData
+                                crop: true
                             }
                             Rectangle {
                                 visible: modelData.kind === "video" && modelData.downloaded
@@ -272,7 +303,7 @@ Item {
                     height: kind === "sticker" ? 140 : 220
                     Image {
                         anchors.fill: parent
-                        visible: kind !== "gif" && message.downloaded
+                        visible: (kind === "image" || kind === "sticker") && message.downloaded
                         source: message.fileUrl || ""
                         fillMode: Image.PreserveAspectFit
                         asynchronous: true
@@ -280,10 +311,22 @@ Item {
                     }
                     AnimatedImage {
                         anchors.fill: parent
-                        visible: kind === "gif" && message.downloaded
+                        visible: kind === "gif" && message.downloaded && !Model.playsAsVideo(message)
                         source: message.fileUrl || ""
                         fillMode: Image.PreserveAspectFit
-                        playing: true
+                        playing: visible && !root.pooled
+                    }
+                    Image {
+                        anchors.fill: parent
+                        visible: kind === "gif" && !!(message.thumbUrl) && (message.downloaded ? Model.playsAsVideo(message) : true)
+                        source: message.thumbUrl || ""
+                        fillMode: Image.PreserveAspectFit
+                        asynchronous: true
+                        cache: true
+                    }
+                    LoopVideo {
+                        anchors.fill: parent
+                        media: root.message
                     }
                     Rectangle {
                         anchors.fill: parent
@@ -333,7 +376,7 @@ Item {
                         color: Qt.rgba(0, 0, 0, 0.45)
                         Text {
                             anchors.centerIn: parent
-                            text: "\u25B6"
+                            text: message.downloaded ? "\u25B6" : "\u2193"
                             textFormat: Text.PlainText
                             color: "#ffffff"
                             font.pixelSize: 16
@@ -380,47 +423,71 @@ Item {
                     font.pixelSize: 12
                 }
 
-                TextEdit {
-                    id: body
+                Item {
+                    id: bodyWrap
                     visible: !!(linked.plain) && !urlOnly
                     width: parent.width
-                    height: contentHeight
-                    readOnly: true
-                    selectByMouse: true
-                    selectByKeyboard: true
-                    persistentSelection: true
-                    cursorVisible: false
-                    textMargin: 0
-                    wrapMode: TextEdit.Wrap
-                    textFormat: linked.hasLinks ? TextEdit.RichText : TextEdit.PlainText
-                    text: linked.hasLinks ? linked.html : linked.plain
-                    color: Theme.textPrimary
-                    selectionColor: Theme.selection
-                    selectedTextColor: Theme.onAccent
-                    font.family: Theme.fontFamily
-                    font.pixelSize: 13
-                    onLinkActivated: function(link) {
-                        var parsed = Model.parseLink(link)
-                        root.openLink(parsed && parsed.url ? parsed : { url: link }, false)
+                    height: linked.hasLinks ? bodyLinks.implicitHeight : body.contentHeight
+
+                    // Real URLs stay on Text/StyledText. TextEdit.RichText keeps the
+                    // last link char-format when ListView reuses the row, so a later
+                    // plain message paints as a clickable TikTok (or whatever the
+                    // previous row linked).
+                    Text {
+                        id: bodyLinks
+                        visible: linked.hasLinks
+                        width: parent.width
+                        wrapMode: Text.Wrap
+                        textFormat: Text.StyledText
+                        text: linked.html
+                        color: Theme.textPrimary
+                        font.family: Theme.fontFamily
+                        font.pixelSize: 13
+                        onLinkActivated: function(link) {
+                            var parsed = Model.parseLink(link)
+                            root.openLink(parsed && parsed.url ? parsed : { url: link }, false)
+                        }
                     }
-                    Keys.onPressed: function(event) {
-                        if (!event.matches(StandardKey.Copy))
-                            return
-                        var t = selectedText || Model.copyableText(root.message)
-                        if (!t)
-                            return
-                        event.accepted = true
-                        WhatsApp.copyText(t)
+
+                    TextEdit {
+                        id: body
+                        visible: !linked.hasLinks
+                        width: parent.width
+                        height: contentHeight
+                        readOnly: true
+                        selectByMouse: true
+                        selectByKeyboard: true
+                        persistentSelection: true
+                        cursorVisible: false
+                        textMargin: 0
+                        wrapMode: TextEdit.Wrap
+                        textFormat: TextEdit.PlainText
+                        text: linked.plain
+                        color: Theme.textPrimary
+                        selectionColor: Theme.selection
+                        selectedTextColor: Theme.onAccent
+                        font.family: Theme.fontFamily
+                        font.pixelSize: 13
+                        Keys.onPressed: function(event) {
+                            if (!event.matches(StandardKey.Copy))
+                                return
+                            var t = selectedText || Model.copyableText(root.message)
+                            if (!t)
+                                return
+                            event.accepted = true
+                            WhatsApp.copyText(t)
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            enabled: !(message && message.pollId)
+                            acceptedButtons: Qt.LeftButton
+                            preventStealing: true
+                            propagateComposedEvents: true
+                            cursorShape: Qt.IBeamCursor
+                            onPressed: function(mouse) { mouse.accepted = false }
+                        }
                     }
-                    MouseArea {
-                        anchors.fill: parent
-                        enabled: !(message && message.pollId)
-                        acceptedButtons: Qt.LeftButton
-                        preventStealing: true
-                        propagateComposedEvents: true
-                        cursorShape: Qt.IBeamCursor
-                        onPressed: function(mouse) { mouse.accepted = false }
-                    }
+
                     // Poll votes carry the poll they belong to: tap to jump to it.
                     MouseArea {
                         anchors.fill: parent

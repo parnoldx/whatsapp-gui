@@ -20,6 +20,7 @@ func extractMedia(m *waProto.Message, pm *ParsedMessage) {
 			FileSHA256:    clone(img.GetFileSHA256()),
 			FileEncSHA256: clone(img.GetFileEncSHA256()),
 			FileLength:    img.GetFileLength(),
+			Thumbnail:     jpegThumb(img.GetJPEGThumbnail()),
 		}
 	}
 
@@ -40,6 +41,7 @@ func extractMedia(m *waProto.Message, pm *ParsedMessage) {
 			FileSHA256:    clone(vid.GetFileSHA256()),
 			FileEncSHA256: clone(vid.GetFileEncSHA256()),
 			FileLength:    vid.GetFileLength(),
+			Thumbnail:     jpegThumb(vid.GetJPEGThumbnail()),
 		}
 	}
 
@@ -89,6 +91,15 @@ func extractMedia(m *waProto.Message, pm *ParsedMessage) {
 			FileLength:    sticker.GetFileLength(),
 		}
 	}
+}
+
+const maxJPEGThumb = 256 << 10
+
+func jpegThumb(b []byte) []byte {
+	if len(b) < 24 || len(b) > maxJPEGThumb || b[0] != 0xff || b[1] != 0xd8 {
+		return nil
+	}
+	return clone(b)
 }
 
 func extractLocation(m *waProto.Message, pm *ParsedMessage) {
