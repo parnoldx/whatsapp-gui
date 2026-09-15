@@ -101,13 +101,8 @@ func runWacli(args []string, opts wacliOpts) (map[string]any, *helperError) {
 		}
 		return nil, fail("wacli command failed")
 	}
-	done := make(chan error, 1)
-	go func() { done <- ec.Wait() }()
-	select {
-	case <-done:
-	case <-time.After(opts.timeout):
-		_ = ec.Process.Kill()
-		<-done
+	runErr := waitTimeout(ec, opts.timeout)
+	if errors.Is(runErr, errTimedOut) {
 		return nil, fail("wacli timed out")
 	}
 	stdout := ec.Stdout.(*limitedBuffer)

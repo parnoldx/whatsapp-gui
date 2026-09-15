@@ -449,15 +449,6 @@ func resolveWithYtdlp(raw, host string) string {
 	return ""
 }
 
-// previewMap converts a linkPreview struct into the JSON shape the GUI reads.
-func previewMap(p linkPreview, fetched bool) map[string]any {
-	return map[string]any{
-		"url": p.url, "host": p.host, "site": p.site, "label": p.label,
-		"title": p.label, "description": "", "imageUrl": "",
-		"embedUrl": p.embedURL, "fetched": fetched,
-	}
-}
-
 func attachLinkPreview(text string, cache map[string]any) map[string]any {
 	raw := firstURL(text)
 	if raw == "" {

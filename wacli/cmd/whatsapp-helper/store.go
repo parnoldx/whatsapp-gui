@@ -6,7 +6,6 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -456,7 +455,7 @@ func loadMentionNames(store string, ids []string, con *sql.DB) map[string]string
 	args := keysOf(idents)
 	if len(jids) > 0 {
 		where = fmt.Sprintf("jid IN (%s) OR %s", placeholders(len(jids)), where)
-		args = append(keysOfSet(seenJIDs), args...)
+		args = append(keysOf(seenJIDs), args...)
 	}
 	rows, err := con.Query(`
 		SELECT jid, phone, full_name, business_name, push_name, first_name
@@ -512,8 +511,6 @@ func keysOf(m map[string]bool) []string {
 	sort.Strings(out)
 	return out
 }
-
-func keysOfSet(m map[string]bool) []string { return keysOf(m) }
 
 // --- messages ---
 
@@ -1312,5 +1309,3 @@ func validateMentions(store, chatJID string, mentions []string) ([]string, *help
 	}
 	return out, nil
 }
-
-var _ = time.Now

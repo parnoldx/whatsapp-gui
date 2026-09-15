@@ -81,7 +81,6 @@ var commands = map[string][]flagSpec{
 		{key: "chat", kind: 's', required: true},
 		{key: "ts", kind: 'i'},
 	},
-	"sync":         {{key: "action", kind: 's', required: true}},
 	"voice-path":   {},
 	"pick-files":   {},
 	"pick-emoji":   {{key: "watch-only", kind: 'b'}},
@@ -145,7 +144,7 @@ func parseArgs(argv []string) (string, map[string]any, *helperError) {
 			}
 		}
 	}
-	if len(positional) > 0 && argv[0] != "sync" {
+	if len(positional) > 0 {
 		return "", nil, fail("bad command")
 	}
 	for _, f := range spec {
@@ -170,8 +169,7 @@ func dispatch(argv []string) (map[string]any, *helperError) {
 	if he != nil {
 		return nil, he
 	}
-	store := firstNonEmpty(storeOverride, strArg(args, "store"))
-	store = storeDir(store)
+	store := storeDir(storeOverride)
 	pruneMedia(7, 6*time.Hour)
 
 	switch cmd {
@@ -254,8 +252,6 @@ func dispatch(argv []string) (map[string]any, *helperError) {
 			return nil, he
 		}
 		return cmdMarkRead(store, jid, intArg(args, "ts", 0))
-	case "sync":
-		return cmdSync(strArg(args, "action"))
 	case "voice-path":
 		return cmdVoicePath(), nil
 	case "pick-files":

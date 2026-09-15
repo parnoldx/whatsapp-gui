@@ -1,11 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -19,13 +20,56 @@ func cryptoRead(b []byte) (int, error) { return rand.Read(b) }
 
 func execLookPath(name string) (string, error) { return exec.LookPath(name) }
 
+// errTimedOut is what runTimeout reports when it had to kill the child.
+var errTimedOut = errors.New("timed out")
+
+// runTimeout starts cmd and waits for it, killing it if it is still alive
+// after d. waitTimeout is the same for an already-started cmd.
+//
+// Every subprocess goes through here. The hand-rolled select/timeout blocks it
+// replaces each received from a buffered-once done channel twice — the second
+// receive blocked forever, which hung the emoji picker on every invocation and
+// wedged the whole daemon pipe on any voice note that needed transcoding.
+//
+// ponytail: kills only the child, and waits for its output pipe to close, so a
+// grandchild holding that pipe would outlast the deadline. No caller spawns
+// one; if that changes, kill the process group instead.
+func runTimeout(cmd *exec.Cmd, d time.Duration) error {
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return waitTimeout(cmd, d)
+}
+
+func waitTimeout(cmd *exec.Cmd, d time.Duration) error {
+	if d <= 0 {
+		return cmd.Wait()
+	}
+	killed := make(chan struct{})
+	timer := time.AfterFunc(d, func() {
+		close(killed)
+		if p := cmd.Process; p != nil {
+			_ = p.Kill()
+		}
+	})
+	defer timer.Stop()
+	err := cmd.Wait()
+	select {
+	case <-killed:
+		return errTimedOut
+	default:
+		return err
+	}
+}
+
 func runCommand(name string, args []string, timeout time.Duration) (string, error) {
 	cmd := exec.Command(name, args...)
-	out, err := cmd.Output()
-	if err != nil {
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := runTimeout(cmd, timeout); err != nil {
 		return "", err
 	}
-	return string(out), nil
+	return out.String(), nil
 }
 
 // --- ffmpeg helpers ---
@@ -48,14 +92,7 @@ func videoThumb(local string) string {
 		cmd := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
 			"-y", "-ss", "0", "-i", src, "-frames:v", "1", "-q:v", "4", dest)
 		cmd.Stdin = nil
-		done := make(chan error, 1)
-		go func() { done <- cmd.Run() }()
-		select {
-		case <-done:
-		case <-time.After(8 * time.Second):
-			_ = cmd.Process.Kill()
-			<-done
-		}
+		_ = runTimeout(cmd, 8*time.Second)
 	}
 	if st, err := os.Stat(dest); err == nil && st.Size() > 32 {
 		_ = os.Chmod(dest, 0o600)
@@ -121,16 +158,7 @@ func transcodeVoice(path string) (string, *helperError) {
 	dest := filepath.Join(folder, randomHex(16)+".ogg")
 	cmd := exec.Command(ffmpeg, "-y", "-i", path,
 		"-c:a", "libopus", "-b:a", "24k", "-ac", "1", "-ar", "48000", dest)
-	done := make(chan error, 1)
-	go func() { done <- cmd.Run() }()
-	select {
-	case <-done:
-	case <-time.After(60 * time.Second):
-		_ = cmd.Process.Kill()
-		<-done
-		return "", fail("could not convert the voice note")
-	}
-	if err := <-done; err != nil || !isOggOpus(dest) {
+	if err := runTimeout(cmd, 60*time.Second); err != nil || !isOggOpus(dest) {
 		_ = os.Remove(dest)
 		return "", fail("could not convert the voice note to OGG/Opus")
 	}
@@ -414,8 +442,6 @@ func resolveDownload(dest string) (string, *helperError) {
 			return best, nil
 		}
 	}
-	base := dest
-	_ = base
 	// siblings: dest* glob in the parent dir
 	siblings, _ := filepath.Glob(dest + "*")
 	var best string
@@ -525,20 +551,6 @@ func fetchMedia(store, jid, msgID, dest, mimeType, kind, filename string) (map[s
 func syncActive() bool {
 	out, err := exec.Command("systemctl", "--user", "is-active", "wacli-sync.service").Output()
 	return err == nil && strings.TrimSpace(string(out)) == "active"
-}
-
-func cmdSync(action string) (map[string]any, *helperError) {
-	switch action {
-	case "status":
-		return map[string]any{"active": syncActive()}, nil
-	case "start", "stop":
-	default:
-		return nil, fail("unknown sync action")
-	}
-	if err := exec.Command("systemctl", "--user", action, "wacli-sync.service").Run(); err != nil {
-		return nil, fail("could not %s background sync", action)
-	}
-	return map[string]any{"active": syncActive()}, nil
 }
 
 func cmdStatus(store string) (map[string]any, *helperError) {
@@ -893,5 +905,3 @@ func pruneOldFiles(folder string, cutoff time.Time) {
 		}
 	}
 }
-
-var _ = json.Marshal

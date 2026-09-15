@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"strings"
@@ -25,23 +26,12 @@ func clipboardText() string {
 		return ""
 	}
 	cmd := exec.Command(wl, "-n")
-	done := make(chan error, 1)
-	var out []byte
-	go func() {
-		var err error
-		out, err = cmd.Output()
-		done <- err
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		_ = cmd.Process.Kill()
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := runTimeout(cmd, 2*time.Second); err != nil || out.Len() == 0 {
 		return ""
 	}
-	if <-done != nil || len(out) == 0 {
-		return ""
-	}
-	return string(out)
+	return out.String()
 }
 
 func setClipboard(text string) {
@@ -51,13 +41,7 @@ func setClipboard(text string) {
 	}
 	cmd := exec.Command(wl, "--type", "text/plain")
 	cmd.Stdin = strings.NewReader(text)
-	done := make(chan struct{}, 1)
-	go func() { _ = cmd.Run(); done <- struct{}{} }()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		_ = cmd.Process.Kill()
-	}
+	_ = runTimeout(cmd, 2*time.Second)
 }
 
 func emojiOverlayOpen() bool {
@@ -194,26 +178,14 @@ func cmdPickFiles() (map[string]any, *helperError) {
 		return nil, fail("zenity is not installed")
 	}
 	cmd := exec.Command(zenity, "--file-selection", "--multiple", "--separator=\n", "--title=Attach files")
-	var out []byte
-	done := make(chan error, 1)
-	go func() {
-		var e error
-		out, e = cmd.Output()
-		done <- e
-	}()
-	var zenityErr error
-	select {
-	case zenityErr = <-done:
-	case <-time.After(300 * time.Second):
-		_ = cmd.Process.Kill()
-		<-done
-		return map[string]any{"files": []map[string]any{}}, nil
-	}
-	if zenityErr != nil {
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	// Cancel and timeout both mean "no files".
+	if err := runTimeout(cmd, 300*time.Second); err != nil {
 		return map[string]any{"files": []map[string]any{}}, nil
 	}
 	files := []map[string]any{}
-	for _, line := range strings.Split(string(out), "\n") {
+	for _, line := range strings.Split(out.String(), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -273,29 +245,16 @@ func cmdClipboard() (map[string]any, *helperError) {
 		}
 		_ = os.Chmod(folder, 0o700)
 		dest := folder + "/" + randomHex(16) + imageExt[imageType]
-		var out []byte
 		cmd := exec.Command(wl, "-t", imageType)
-		done := make(chan error, 1)
-		go func() {
-			var err error
-			out, err = cmd.Output()
-			done <- err
-		}()
-		var pasteErr error
-		select {
-		case pasteErr = <-done:
-		case <-time.After(10 * time.Second):
-			_ = cmd.Process.Kill()
-			<-done
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		if err := runTimeout(cmd, 10*time.Second); err != nil || out.Len() == 0 {
 			return nil, fail("clipboard image is empty")
 		}
-		if pasteErr != nil || len(out) == 0 {
-			return nil, fail("clipboard image is empty")
-		}
-		if len(out) > maxFile {
+		if out.Len() > maxFile {
 			return nil, fail("clipboard image is too large")
 		}
-		if err := os.WriteFile(dest, out, 0o600); err != nil {
+		if err := os.WriteFile(dest, out.Bytes(), 0o600); err != nil {
 			return nil, fail("could not save the clipboard image")
 		}
 		return map[string]any{"kind": "file", "path": dest, "fileUrl": fileURL(dest), "name": "clipboard" + imageExt[imageType]}, nil
