@@ -197,18 +197,19 @@ func cmdPickFiles() (map[string]any, *helperError) {
 	var out []byte
 	done := make(chan error, 1)
 	go func() {
-		var err error
-		out, err = cmd.Output()
-		done <- err
+		var e error
+		out, e = cmd.Output()
+		done <- e
 	}()
+	var zenityErr error
 	select {
-	case <-done:
+	case zenityErr = <-done:
 	case <-time.After(300 * time.Second):
 		_ = cmd.Process.Kill()
 		<-done
 		return map[string]any{"files": []map[string]any{}}, nil
 	}
-	if <-done != nil {
+	if zenityErr != nil {
 		return map[string]any{"files": []map[string]any{}}, nil
 	}
 	files := []map[string]any{}
@@ -219,7 +220,7 @@ func cmdPickFiles() (map[string]any, *helperError) {
 		}
 		path, he := validateFile(line)
 		if he != nil {
-			continue
+			return nil, fail("%s: %s", fileNameOf(line), he.msg)
 		}
 		files = append(files, map[string]any{
 			"path": path, "fileUrl": fileURL(path), "name": fileNameOf(path),

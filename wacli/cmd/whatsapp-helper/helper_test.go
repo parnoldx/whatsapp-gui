@@ -1858,3 +1858,41 @@ func TestMarkReadRollsAckBackWhenWacliFails(t *testing.T) {
 		t.Errorf("ack = %d, want 0", got)
 	}
 }
+
+// Regression: pick-files used to block forever on a second <-done after the
+// select already drained the channel, deadlocking the GUI's helper pipe.
+func TestPickFilesReturnsAfterDialogCloses(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "picked.mp4")
+	if err := os.WriteFile(fake, []byte("fake"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "zenity")
+	script := "#!/bin/sh\nprintf '%s\\n' \"" + fake + "\"\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	type result struct {
+		data map[string]any
+		he   *helperError
+	}
+	ch := make(chan result, 1)
+	go func() {
+		data, err := dispatch([]string{"pick-files"})
+		ch <- result{data, err}
+	}()
+	select {
+	case r := <-ch:
+		if r.he != nil {
+			t.Fatalf("pick-files failed: %v", r.he)
+		}
+		files, _ := r.data["files"].([]map[string]any)
+		if len(files) != 1 || files[0]["path"] != fake {
+			t.Fatalf("unexpected files payload: %v", r.data)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pick-files did not return after the dialog closed")
+	}
+}
