@@ -47,15 +47,6 @@ test("filterChats accepts QVariantList-shaped objects", () => {
   assert.equal(Model.filterChats(like, "crew")[0].name, "Crew")
 })
 
-test("badgeCount ignores muted chats and acknowledged timestamps", () => {
-  const chats = [
-    { jid: "a", lastMessageTs: 10, unreadCount: 2, muted: false },
-    { jid: "b", lastMessageTs: 10, unreadCount: 4, muted: true }
-  ]
-  assert.equal(Model.badgeCount(chats, {}), 1)
-  assert.equal(Model.badgeCount(chats, { a: 10 }), 0)
-})
-
 test("visibleUnread hides the count only after ack, even for the open chat", () => {
   const chat = { jid: "a", lastMessageTs: 10, unreadCount: 31 }
   assert.equal(Model.visibleUnread(chat, {}, ""), 31)
@@ -71,8 +62,6 @@ test("adoptThread switches chats immediately and keeps the same chat during refr
   assert.equal(Model.adoptThread(shown, incoming, "a")[0].id, "a1")
   const next = [{ id: "b1", chatJid: "b" }]
   assert.equal(Model.adoptThread(shown, next, "b")[0].id, "b1")
-  assert.equal(Model.messageIds(shown), "a1\na2")
-  assert.equal(Model.messageIds(shown), Model.messageIds(shown))
 })
 
 test("messageHasId matches the bubble, the album stub, or a tile", () => {
@@ -93,7 +82,6 @@ test("threadStamp changes when a patched field flips on the same id list", () =>
   const before = [{ id: "a1" }, { id: "a2", downloaded: false }]
   const afterDownload = [{ id: "a1" }, { id: "a2", downloaded: true }]
   const afterReact = [{ id: "a1", reactions: [{ emoji: "👍", count: 1 }], myReaction: "👍" }, { id: "a2" }]
-  assert.equal(Model.messageIds(before), Model.messageIds(afterDownload))  // id list unchanged
   assert.notEqual(Model.threadStamp(before), Model.threadStamp(afterDownload))
   assert.notEqual(Model.threadStamp(before), Model.threadStamp(afterReact))
   assert.equal(Model.threadStamp(before), Model.threadStamp(before))

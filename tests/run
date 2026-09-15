@@ -3,3 +3,6 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 (cd "$root/wacli" && go test -tags sqlite_fts5 -timeout 300s ./cmd/whatsapp-helper)
 node --test "$root/tests/model.test.js"
+cmake -B "$root/build" -DCMAKE_BUILD_TYPE=Release >/dev/null
+cmake --build "$root/build" -j --target pipe-test >/dev/null
+ctest --test-dir "$root/build" --output-on-failure

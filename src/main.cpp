@@ -8,6 +8,8 @@
 #include <QQuickWindow>
 #include <QTimer>
 
+#include <cstdio>
+
 #include "OmarchyTheme.hpp"
 #include "WhatsApp.hpp"
 
@@ -68,7 +70,9 @@ int main(int argc, char *argv[]) {
         else if (args[i] == QLatin1String("--chat") && i + 1 < args.size())
             chatArg = args[++i];
         else if (args[i] == QLatin1String("--help")) {
-            // printed only for humans
+            fputs("usage: whatsapp-gui [--toggle] [--chat JID]\n"
+                  "  --toggle     hide the running window, or show and raise it\n"
+                  "  --chat JID   open a chat in the running window\n", stdout);
             return 0;
         }
     }

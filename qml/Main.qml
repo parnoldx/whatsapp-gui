@@ -21,7 +21,6 @@ ApplicationWindow {
     readonly property bool compact: width < 860
     property string query: ""
     property var viewer: null
-    property var embedLogins: ({ })
     property bool stickToEnd: true
     property bool pinning: false
     property real anchorY: 0
@@ -273,15 +272,6 @@ ApplicationWindow {
     function closeViewer() {
         player.stop()
         win.viewer = null
-        // A login inside the embed viewer commits to the cookie DB lazily.
-        WhatsApp.refreshEmbedLogins()
-        embedLoginRecheck.restart()
-    }
-
-    Timer {
-        id: embedLoginRecheck
-        interval: 20000
-        onTriggered: WhatsApp.refreshEmbedLogins()
     }
 
     WebEngineProfile {
@@ -290,7 +280,6 @@ ApplicationWindow {
         offTheRecord: false
         persistentCookiesPolicy: WebEngineProfile.ForcePersistentCookies
         Component.onCompleted: {
-            WhatsApp.refreshEmbedLogins()
             var prep = WebEngine.script()
             prep.name = "tiktok-embed-prep"
             prep.injectionPoint = WebEngineScript.DocumentCreation
@@ -456,15 +445,6 @@ ApplicationWindow {
                     failed: true
                 }
         }
-    }
-
-    function markEmbedLogin(host) {
-        if (win.embedLogins[host])
-            return
-        var m = Object.assign({}, win.embedLogins)
-        m[host] = true
-        win.embedLogins = m
-        WhatsApp.refreshEmbedLogins()
     }
 
     function embedHost(url) {
@@ -1195,11 +1175,6 @@ ApplicationWindow {
                                 if (info.status === WebEngineView.LoadSucceededStatus) {
                                     playTimer.tries = 0
                                     playTimer.restart()
-                                    if (win.viewer && win.viewer.direct
-                                        && win.embedHost(win.viewer.embedUrl) === "instagram.com")
-                                        embed.runJavaScript(
-                                            "(function(){return document.cookie.indexOf('ds_user_id')!==-1})()",
-                                            function(ok) { if (ok) win.markEmbedLogin("instagram.com") })
                                 }
                             }
                             onNavigationRequested: function(request) {

@@ -16,8 +16,6 @@
 #include <QQmlEngine>
 #include <QStandardPaths>
 #include <QTimer>
-#include <QFile>
-#include <sqlite3.h>
 
 // ponytail: WA_DEBUG=1 traces the job queue; drop once the wedge is understood.
 static bool waDebug() {
@@ -27,63 +25,18 @@ static bool waDebug() {
 
 // Stop queued work and cookie updates before members tear down: timers can
 // still fire from QProcess's waitForFinished window and re-enter kick().
+//
+// The process has to be reaped here too. ~QProcess flushes whatever the daemon
+// last wrote and fires readyReadStandardOutput one more time — by then the
+// QByteArray members declared after m_proc are already destroyed, so the
+// handler appends into freed memory and the exit aborts in realloc().
 WhatsApp::~WhatsApp() {
     m_shuttingDown = true;
     m_queue.clear();
-}
-
-// Reads login markers straight from the embed webview's cookie DB (the QML
-// profile API doesn't expose the cookie store). Covers httpOnly sessions like
-// TikTok's. Chromium commits cookies to disk lazily (~30s), so callers refresh
-// at startup, when the viewer closes, and shortly after.
-void WhatsApp::refreshEmbedLogins() {
-    if (m_shuttingDown)
-        return;
-    static const QSet<QString> loginCookies = {
-        QStringLiteral("sessionid"),   // instagram, tiktok
-        QStringLiteral("SAPISID"),     // youtube/google
-        QStringLiteral("auth_token"),  // x/twitter
-        QStringLiteral("c_user"),      // facebook
-    };
-    const QString src = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
-        + QStringLiteral("/QtWebEngine/whatsapp-link-embed/Cookies");
-    if (!QFileInfo::exists(src))
-        return;
-    // Copy first: Chromium keeps the live DB locked for writers.
-    const QString tmp = QStandardPaths::writableLocation(QStandardPaths::TempLocation)
-        + QStringLiteral("/wa-cookie-scan");
-    QFile::remove(tmp);
-    if (!QFile::copy(src, tmp))
-        return;
-    sqlite3 *db = nullptr;
-    if (sqlite3_open_v2(tmp.toUtf8().constData(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
-        if (db)
-            sqlite3_close(db);
-        QFile::remove(tmp);
-        return;
-    }
-    QVariantMap logins;
-    sqlite3_stmt *stmt = nullptr;
-    if (sqlite3_prepare_v2(db, "SELECT host_key, name FROM cookies", -1, &stmt, nullptr) == SQLITE_OK) {
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            const QString host = QString::fromUtf8(reinterpret_cast<const char *>(sqlite3_column_text(stmt, 0)));
-            const QString name = QString::fromUtf8(reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1)));
-            if (!loginCookies.contains(name))
-                continue;
-            QString h = host;
-            if (h.startsWith(QLatin1Char('.')))
-                h.remove(0, 1);
-            if (h.startsWith(QLatin1String("www.")))
-                h.remove(0, 4);
-            logins.insert(h, true);
-        }
-        sqlite3_finalize(stmt);
-    }
-    sqlite3_close(db);
-    QFile::remove(tmp);
-    if (logins != m_embedLogins) {
-        m_embedLogins = logins;
-        emit embedLoginsChanged();
+    disconnect(&m_proc, nullptr, this, nullptr);
+    if (m_proc.state() != QProcess::NotRunning) {
+        m_proc.kill();
+        m_proc.waitForFinished(1000);
     }
 }
 
@@ -365,10 +318,11 @@ void WhatsApp::kick() {
         qWarning().noquote() << "[wa] run" << m_current.kind << m_current.args.value(2)
                              << "queued:" << kinds.join(u',');
     }
-    m_stdout.clear();
-    m_stderr.clear();
     updateActivity();
     if (m_useDaemon) {
+        // Never clear m_stdout here: it may hold lines the daemon already sent
+        // (a push trailing a job response, or a half-read line). Dropping them
+        // loses the push and mis-frames the next answer.
         QJsonArray arr;
         for (const QString &a : m_current.args)
             arr.append(a);
@@ -376,7 +330,9 @@ void WhatsApp::kick() {
         m_proc.write("\n");
         return;
     }
-    // Fallback: one helper process per call.
+    // Fallback: one helper process per call, so its buffers start empty.
+    m_stdout.clear();
+    m_stderr.clear();
     m_oneShotPending = true;
     m_daemonUptime.start();
     m_proc.start(helperPath(), m_current.args);
@@ -612,12 +568,6 @@ void WhatsApp::apply(const Job &job, const QVariantMap &data) {
     if (kind == QLatin1String("receipts")) {
         m_receipts = data.value(QStringLiteral("receipts")).toBool();
         emit statusChanged();
-        return;
-    }
-    if (kind == QLatin1String("sync")) {
-        m_syncActive = data.value(QStringLiteral("active")).toBool();
-        emit statusChanged();
-        updateActivity();
         return;
     }
     if (kind == QLatin1String("sent")) {
@@ -1002,11 +952,6 @@ void WhatsApp::markAllRead() {
 void WhatsApp::setReceipts(bool on) {
     call({QStringLiteral("receipts"), on ? QStringLiteral("--on") : QStringLiteral("--off")},
          QStringLiteral("receipts"));
-}
-
-void WhatsApp::setOnline(bool on) {
-    call({QStringLiteral("sync"), on ? QStringLiteral("start") : QStringLiteral("stop")},
-         QStringLiteral("sync"));
 }
 
 void WhatsApp::sendText(const QString &text, const QVariantList &mentions, const QString &replyId) {

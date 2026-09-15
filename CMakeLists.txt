@@ -28,8 +28,7 @@ qt_add_resources(whatsapp-gui "qml"
 
 target_include_directories(whatsapp-gui PRIVATE src)
 target_link_libraries(whatsapp-gui PRIVATE
-    Qt6::Core Qt6::Gui Qt6::Network Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Multimedia Qt6::WebEngineQuick
-    sqlite3)
+    Qt6::Core Qt6::Gui Qt6::Network Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Multimedia Qt6::WebEngineQuick)
 
 # The Go backend: the helper binary embedding wacli (vendored under wacli/),
 # plus the wacli CLI itself, needed for the initial `wacli auth` pairing.
@@ -68,3 +67,16 @@ install(FILES share/applications/whatsapp-gui.desktop
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/applications)
 install(FILES share/icons/hicolor/scalable/apps/whatsapp-gui.svg
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/scalable/apps)
+
+# The daemon-pipe framing test drives the real WhatsApp class against a stub
+# helper (tests/stub-helper.sh), so it needs no wacli store and no network.
+find_package(Qt6 COMPONENTS Test QUIET)
+if(Qt6Test_FOUND)
+    enable_testing()
+    add_executable(pipe-test tests/pipe_test.cpp src/WhatsApp.hpp src/WhatsApp.cpp)
+    target_include_directories(pipe-test PRIVATE src)
+    target_compile_definitions(pipe-test PRIVATE STUB_HELPER="${CMAKE_CURRENT_SOURCE_DIR}/tests/stub-helper.sh")
+    target_link_libraries(pipe-test PRIVATE Qt6::Core Qt6::Gui Qt6::Qml Qt6::Test)
+    add_test(NAME pipe COMMAND pipe-test)
+    set_tests_properties(pipe PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+endif()

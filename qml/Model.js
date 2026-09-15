@@ -109,18 +109,6 @@ function visibleUnread(chat, acks, selectedJid) {
   return Number(chat.unreadCount || 0)
 }
 
-function badgeCount(chats, acks) {
-  var list = asList(chats)
-  var map = acks || {}
-  var total = 0
-  for (var i = 0; i < list.length; i++) {
-    var chat = list[i]
-    if (!chat || chat.muted || chat.archived) continue
-    if (visibleUnread(chat, map, "") > 0) total += 1
-  }
-  return total
-}
-
 function adoptThread(shown, incoming, selectedJid) {
   if (!selectedJid) return []
   var list = asList(incoming)
@@ -128,13 +116,6 @@ function adoptThread(shown, incoming, selectedJid) {
   var current = asList(shown)
   if (current.length && current[0] && current[0].chatJid === selectedJid) return current
   return []
-}
-
-function messageIds(messages) {
-  var list = asList(messages)
-  var out = []
-  for (var i = 0; i < list.length; i++) out.push(String((list[i] && list[i].id) || ""))
-  return out.join("\n")
 }
 
 function messageHasId(m, id) {
@@ -181,9 +162,9 @@ function firstUnreadIndex(messages, unread, ack) {
   return (n > 0 && n < list.length) ? list.length - n : -1
 }
 
-// Like messageIds, but also folds in the fields that get patched in place on an
-// otherwise-unchanged thread (download state, link-preview fetch, reactions), so
-// the view re-adopts when one of those flips instead of showing stale data.
+// Folds in the fields that get patched in place on an otherwise-unchanged
+// thread (download state, link-preview fetch, reactions), so the view
+// re-adopts when one of those flips instead of showing stale data.
 function threadStamp(messages) {
   var list = asList(messages)
   var out = []
@@ -646,9 +627,7 @@ if (typeof module !== "undefined" && module.exports) {
     copyableText: copyableText,
     filterChats: filterChats,
     visibleUnread: visibleUnread,
-    badgeCount: badgeCount,
     adoptThread: adoptThread,
-    messageIds: messageIds,
     messageHasId: messageHasId,
     chatByJid: chatByJid,
     indexOfId: indexOfId,
