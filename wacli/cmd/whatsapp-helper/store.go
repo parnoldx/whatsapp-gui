@@ -545,7 +545,14 @@ type msgRow struct {
 // pollVoteText is what the parser stores as the body of a PollUpdateMessage.
 const pollVoteText = "Poll vote"
 
+// listMessages is listMessagesQuery without a text filter.
 func listMessages(store, jid string, limit int, before int64) ([]map[string]any, *helperError) {
+	return listMessagesQuery(store, jid, limit, before, "")
+}
+
+// listMessagesQuery reads a thread window; a non-empty needle keeps only rows
+// whose text, caption or filename contains it (case-insensitive ASCII LIKE).
+func listMessagesQuery(store, jid string, limit int, before int64, needle string) ([]map[string]any, *helperError) {
 	if limit < 1 {
 		limit = 1
 	}
@@ -608,6 +615,14 @@ func listMessages(store, jid string, limit int, before int64) ([]map[string]any,
 	if before > 0 {
 		clause = "AND m.ts < ?"
 		args = append(args, before)
+	}
+	if needle = strings.TrimSpace(needle); needle != "" {
+		like := "%" + escapeLike(needle) + "%"
+		clause += " AND (IFNULL(m.text,'') LIKE ? ESCAPE '\\'" +
+			" OR IFNULL(m.display_text,'') LIKE ? ESCAPE '\\'" +
+			" OR IFNULL(m.media_caption,'') LIKE ? ESCAPE '\\'" +
+			" OR IFNULL(m.filename,'') LIKE ? ESCAPE '\\')"
+		args = append(args, like, like, like, like)
 	}
 	args = append(args, limit)
 	query = strings.Replace(query, "%CLAUSE%", clause, 1)
@@ -851,6 +866,10 @@ func listMessages(store, jid string, limit int, before int64) ([]map[string]any,
 	}
 	fillAlbumQuotes(items)
 	return foldAlbums(items), nil
+}
+
+func escapeLike(s string) string {
+	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
 }
 
 func rowReaxOrEmpty(r []map[string]any) []map[string]any {

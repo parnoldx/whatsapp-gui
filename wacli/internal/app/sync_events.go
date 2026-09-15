@@ -547,6 +547,7 @@ func (a *App) handleLiveSyncMessage(ctx context.Context, opts SyncOptions, v *ev
 	if pm.ReactionToID != "" && pm.ReactionEmoji == "" && v.Message != nil && v.Message.GetEncReactionMessage() != nil {
 		a.decryptEncryptedReaction(ctx, &pm, v)
 	}
+	a.decryptEncryptedEdit(ctx, &pm, v)
 	incrementUnread := a.shouldIncrementLiveUnread(ctx, pm)
 	if err := a.storeParsedMessageForSync(ctx, pm, limits...); err == nil {
 		if incrementUnread {
@@ -823,6 +824,35 @@ func (a *App) decryptEncryptedReaction(ctx context.Context, pm *wa.ParsedMessage
 			pm.ReactionToID = key.GetID()
 		}
 	}
+}
+
+func (a *App) decryptEncryptedEdit(ctx context.Context, pm *wa.ParsedMessage, msg *events.Message) {
+	enc := msg.Message.GetSecretEncryptedMessage()
+	if enc == nil || enc.GetSecretEncType() != waE2E.SecretEncryptedMessage_MESSAGE_EDIT {
+		return
+	}
+	decrypted, err := a.wa.DecryptSecretEncryptedMessage(ctx, msg)
+	if err != nil {
+		a.emitWarning(
+			"edit_decrypt_failed",
+			fmt.Sprintf("warning: failed to decrypt message edit %s: %v", pm.ID, err),
+			map[string]any{"message_id": pm.ID, "error": err.Error()},
+		)
+		return
+	}
+	// The decrypted payload holds a MESSAGE_EDIT protocol message whose key
+	// points at the original message; extractWAProto remaps ID/chat there.
+	edited := wa.ParseLiveMessage(&events.Message{Info: msg.Info, Message: decrypted})
+	pm.ID = edited.ID
+	pm.Chat = edited.Chat
+	pm.SenderJID = edited.SenderJID
+	pm.FromMe = edited.FromMe
+	pm.Text = edited.Text
+	pm.Edited = edited.Edited
+	pm.ReplyToID = edited.ReplyToID
+	pm.ReplyToSenderJID = edited.ReplyToSenderJID
+	pm.ReplyToDisplay = edited.ReplyToDisplay
+	pm.UnhandledPayload = edited.UnhandledPayload
 }
 
 // sendPresence sends a global presence update if the WhatsApp client is ready.

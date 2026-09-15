@@ -36,6 +36,7 @@ var commands = map[string][]flagSpec{
 		{key: "chat", kind: 's', required: true},
 		{key: "limit", kind: 'i'},
 		{key: "before", kind: 'i'},
+		{key: "query", kind: 's'},
 	},
 	"participants": {
 		{key: "chat", kind: 's', required: true},
@@ -187,7 +188,7 @@ func dispatch(argv []string) (map[string]any, *helperError) {
 		if he != nil {
 			return nil, he
 		}
-		messages, he := listMessages(store, jid, int(intArg(args, "limit", 80)), intArg(args, "before", 0))
+		messages, he := listMessagesQuery(store, jid, int(intArg(args, "limit", 80)), intArg(args, "before", 0), strArg(args, "query"))
 		if he != nil {
 			return nil, he
 		}

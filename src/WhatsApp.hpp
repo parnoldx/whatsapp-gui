@@ -82,6 +82,8 @@ public:
     Q_INVOKABLE void download(const QVariantMap &message);
     Q_INVOKABLE void react(const QVariantMap &message, const QString &emoji);
     Q_INVOKABLE void fetchLinkPreview(const QString &url);
+    Q_INVOKABLE void searchMessages(const QString &query, QJSValue done);
+    Q_INVOKABLE void loadMessagesAt(const QString &jid, qint64 ts);
     Q_INVOKABLE void refreshEmbedLogins();
     Q_INVOKABLE void fetchAvatar(const QString &jid);
     Q_INVOKABLE void pickFiles(QJSValue done);

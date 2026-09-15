@@ -217,6 +217,38 @@ func TestSearchFiltersWithoutTouchingWacli(t *testing.T) {
 	}
 }
 
+func TestMessagesSearchFiltersThread(t *testing.T) {
+	resetLidMap()
+	f := newFixture(t)
+	con := openrw(t, f.db)
+	msg := func(mid string, ts int64, text string) {
+		mustExec(t, con, insertMsg, []any{
+			"222@g.us", "Crew", mid, "555@s.whatsapp.net", "Sam",
+			ts, 0, text, text, "", "", 0, 0, "", "", "", "", "", "",
+			0, "", 0, 0, 0, 0, 0, "",
+		})
+	}
+	msg("g1", 100, "dinner at seven")
+	msg("g2", 110, "the dinner was great")
+	msg("g3", 120, "unrelated chatter")
+	con.Close()
+	data, err := runHelper(t, []string{"messages", "--chat", "222@g.us", "--query", "DINNER"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := messagesPayload(t, data)
+	if len(msgs) != 2 || msgs[0]["id"] != "g1" || msgs[1]["id"] != "g2" {
+		t.Fatalf("search = %v", msgs)
+	}
+	data, err = runHelper(t, []string{"messages", "--chat", "222@g.us", "--query", "100%"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := messagesPayload(t, data); len(got) != 0 {
+		t.Fatalf("literal %% must not wildcard: %v", got)
+	}
+}
+
 func TestUnsupportedStubShowsButAlbumStubDrops(t *testing.T) {
 	resetLidMap()
 	f := newFixture(t)
@@ -953,28 +985,48 @@ func TestDescribeLinkBuildsOfficialEmbedUrls(t *testing.T) {
 
 func TestPruneMediaDropsOnlyOldFiles(t *testing.T) {
 	newFixture(t)
-	media := filepath.Join(stateDir(), "media")
-	if err := os.MkdirAll(media, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	old := filepath.Join(media, "old.jpg")
-	new := filepath.Join(media, "new.jpg")
-	os.WriteFile(old, []byte("x"), 0o600)
-	os.WriteFile(new, []byte("x"), 0o600)
 	stale := time.Now().Add(-8 * 24 * time.Hour)
-	os.Chtimes(old, stale, stale)
-	pruneMedia(7, 0)
-	if fileExists(old) {
-		t.Error("old file kept")
+	dirs := []string{"media", "link-thumbs", "voice-drafts"}
+	type pair struct{ old, fresh string }
+	folders := make([]pair, 0, len(dirs))
+	for _, dir := range dirs {
+		folder := filepath.Join(stateDir(), dir)
+		if err := os.MkdirAll(folder, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		old := filepath.Join(folder, "old.bin")
+		fresh := filepath.Join(folder, "new.bin")
+		if err := os.WriteFile(old, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fresh, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(old, stale, stale); err != nil {
+			t.Fatal(err)
+		}
+		folders = append(folders, pair{old, fresh})
 	}
-	if !fileExists(new) {
-		t.Error("new file dropped")
+	pruneMedia(7, 0)
+	for i, dir := range dirs {
+		if fileExists(folders[i].old) {
+			t.Errorf("%s: old file kept", dir)
+		}
+		if !fileExists(folders[i].fresh) {
+			t.Errorf("%s: new file dropped", dir)
+		}
 	}
 	// marker gate: a second call within `every` is a no-op even for old files
-	os.Chtimes(new, stale, stale)
+	for _, p := range folders {
+		if err := os.Chtimes(p.fresh, stale, stale); err != nil {
+			t.Fatal(err)
+		}
+	}
 	pruneMedia(7, 6*time.Hour)
-	if !fileExists(new) {
-		t.Error("marker gate failed")
+	for i, dir := range dirs {
+		if !fileExists(folders[i].fresh) {
+			t.Errorf("%s: marker gate failed", dir)
+		}
 	}
 }
 

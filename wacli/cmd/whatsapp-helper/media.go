@@ -862,8 +862,9 @@ func cmdRefreshAvatars(store string) (map[string]any, *helperError) {
 
 // --- media prune ---
 
-// pruneMedia deletes downloaded media older than `days`. Marker-gated so it
-// runs at most once per `every` regardless of how often it's called.
+// pruneMedia deletes downloaded media, link-preview thumbs, and voice drafts
+// older than `days`. Marker-gated so it runs at most once per `every`
+// regardless of how often it's called.
 func pruneMedia(days int, every time.Duration) {
 	marker := filepath.Join(stateDir(), ".media-pruned")
 	nowTS := time.Now()
@@ -871,18 +872,25 @@ func pruneMedia(days int, every time.Duration) {
 		return
 	}
 	cutoff := nowTS.Add(-time.Duration(days) * 24 * time.Hour)
-	folder := filepath.Join(stateDir(), "media")
-	if entries, err := os.ReadDir(folder); err == nil {
-		for _, e := range entries {
-			p := filepath.Join(folder, e.Name())
-			if st, err := os.Stat(p); err == nil && !st.IsDir() && st.ModTime().Before(cutoff) {
-				_ = os.Remove(p)
-			}
-		}
+	for _, name := range []string{"media", "link-thumbs", "voice-drafts"} {
+		pruneOldFiles(filepath.Join(stateDir(), name), cutoff)
 	}
 	f, err := os.OpenFile(marker, os.O_CREATE|os.O_WRONLY, 0o600)
 	if err == nil {
 		f.Close()
+	}
+}
+
+func pruneOldFiles(folder string, cutoff time.Time) {
+	entries, err := os.ReadDir(folder)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		p := filepath.Join(folder, e.Name())
+		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.ModTime().Before(cutoff) {
+			_ = os.Remove(p)
+		}
 	}
 }
 

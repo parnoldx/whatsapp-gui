@@ -926,6 +926,29 @@ void WhatsApp::fetchLinkPreview(const QString &url) {
     call({QStringLiteral("link-preview"), QStringLiteral("--url"), url}, QStringLiteral("link-preview"));
 }
 
+void WhatsApp::searchMessages(const QString &query, QJSValue done) {
+    const QString needle = query.trimmed();
+    if (m_selectedJid.isEmpty() || needle.isEmpty()) {
+        finishJs(done, QString(), QVariantMap{{"messages", QVariantList{}}});
+        return;
+    }
+    call({QStringLiteral("messages"), QStringLiteral("--chat"), m_selectedJid,
+          QStringLiteral("--query"), needle, QStringLiteral("--limit"), QStringLiteral("80")},
+         QStringLiteral("search"), done);
+}
+
+void WhatsApp::loadMessagesAt(const QString &jid, qint64 ts) {
+    // Search navigation: show the window ending on ts so the match is loaded.
+    // Deliberately ignores the pending guard — each step is a distinct window.
+    if (jid.isEmpty() || jid != m_selectedJid)
+        return;
+    m_pendingMessagesJid = jid;
+    call({QStringLiteral("messages"), QStringLiteral("--chat"), jid,
+          QStringLiteral("--limit"), QStringLiteral("80"),
+          QStringLiteral("--before"), QString::number(ts + 1)},
+         QStringLiteral("messages"));
+}
+
 void WhatsApp::overlayAvatars() {
     for (int i = 0; i < m_chats.size(); ++i) {
         QVariantMap chat = m_chats[i].toMap();

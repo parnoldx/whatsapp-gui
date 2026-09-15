@@ -31,7 +31,19 @@ ApplicationWindow {
     property var pendingReactions: ({})
     property var pendingSends: []
     property var pendingReactMsg: null
+    property bool pendingInsert: false
     property string highlightId: ""
+    property bool searchOpen: false
+    property var findResults: []
+    property int findIndex: -1
+    property string focusAfterLoad: ""
+    readonly property string findStatus: {
+        if (!win.searchOpen)
+            return ""
+        if (!String(findField.text || "").trim())
+            return ""
+        return win.findResults.length ? (win.findIndex + 1) + "/" + win.findResults.length : "No matches"
+    }
     property bool unreadPending: false
     property real unreadAck: 0
     property int unreadCount: 0
@@ -65,7 +77,14 @@ ApplicationWindow {
         win.pinning = true
         win.shownMessages = next
         win.shownIds = Model.threadStamp(next)
-        Qt.callLater(win.restoreAnchor)
+        Qt.callLater(function() {
+            win.restoreAnchor()
+            if (win.focusAfterLoad && Model.indexOfId(win.shownMessages, win.focusAfterLoad) >= 0) {
+                var id = win.focusAfterLoad
+                win.focusAfterLoad = ""
+                win.focusMessage(id)
+            }
+        })
     }
 
     function goToNewest() {
@@ -118,12 +137,33 @@ ApplicationWindow {
 
     function finishPick(emoji) {
         var target = win.pendingReactMsg
+        var intoComposer = win.pendingInsert
         win.pendingReactMsg = null
+        win.pendingInsert = false
         emojiSink.text = ""
+        if (intoComposer) {
+            composer.insertEmoji(emoji)
+            return
+        }
         thread.forceActiveFocus()
         if (!emoji || !target)
             return
         win.reactNow(target, emoji)
+    }
+
+    function pickComposerEmoji() {
+        win.pendingInsert = true
+        emojiSink.text = ""
+        emojiSink.forceActiveFocus()
+        // Overlay IPC is instant; the helper only watches the clipboard after.
+        WhatsApp.openEmojiPicker()
+        WhatsApp.pickEmoji(function(err, data) {
+            if (err) {
+                win.pendingInsert = false
+                return
+            }
+            win.finishPick(data && data.emoji ? String(data.emoji) : "")
+        })
     }
 
     function pickReact(msg) {
@@ -512,6 +552,83 @@ ApplicationWindow {
         }
     }
 
+    function openSearch() {
+        if (!win.chat)
+            return
+        win.searchOpen = true
+        win.findResults = []
+        win.findIndex = -1
+        findField.forceActiveFocus()
+        findField.selectAll()
+    }
+
+    function closeSearch() {
+        win.searchOpen = false
+        win.findResults = []
+        win.findIndex = -1
+        win.focusAfterLoad = ""
+        findField.text = ""
+        thread.forceActiveFocus()
+    }
+
+    function runSearch() {
+        findDebounce.restart()
+    }
+
+    function doSearch() {
+        var q = String(findField.text || "").trim()
+        if (!q || !win.chat) {
+            win.findResults = []
+            win.findIndex = -1
+            return
+        }
+        WhatsApp.searchMessages(q, function(err, data) {
+            if (err || String(findField.text || "").trim() !== q)
+                return
+            var list = (data && data.messages) ? data.messages : []
+            var newest = []
+            for (var i = list.length - 1; i >= 0; i--) newest.push(list[i])
+            win.findResults = newest
+            if (!newest.length) {
+                win.findIndex = -1
+                return
+            }
+            win.findIndex = 0
+            win.jumpToResult()
+        })
+    }
+
+    function stepResult(delta) {
+        var n = win.findResults.length
+        if (!n)
+            return
+        win.findIndex = ((win.findIndex + delta) % n + n) % n
+        win.jumpToResult()
+    }
+
+    function jumpToResult() {
+        if (win.findIndex < 0 || win.findIndex >= win.findResults.length)
+            return
+        var r = win.findResults[win.findIndex]
+        var id = r ? String(r.id || "") : ""
+        if (!id)
+            return
+        win.dropUnreadAnchor()
+        win.stickToEnd = false
+        if (Model.indexOfId(win.shownMessages, id) >= 0) {
+            win.focusMessage(id)
+            return
+        }
+        win.focusAfterLoad = id
+        WhatsApp.loadMessagesAt(WhatsApp.selectedJid, Number(r.ts || 0))
+    }
+
+    Timer {
+        id: findDebounce
+        interval: 250
+        onTriggered: win.doSearch()
+    }
+
     Timer {
         id: highlightTimer
         interval: 2000
@@ -541,10 +658,17 @@ ApplicationWindow {
     }
 
     Shortcut {
+        sequences: ["Ctrl+F"]
+        enabled: !!win.chat
+        onActivated: win.searchOpen ? win.closeSearch() : win.openSearch()
+    }
+
+    Shortcut {
         sequences: ["Escape"]
         enabled: win.viewer === null
         onActivated: {
-            if (WhatsApp.selectedJid) WhatsApp.selectedJid = ""
+            if (win.searchOpen) win.closeSearch()
+            else if (WhatsApp.selectedJid) WhatsApp.selectedJid = ""
             else win.hide()
         }
     }
@@ -566,6 +690,10 @@ ApplicationWindow {
         function onSelectedJidChanged() {
             // Runs before the C++ side acks the chat, so acks still hold the
             // timestamp we last read up to.
+            win.searchOpen = false
+            win.findResults = []
+            win.findIndex = -1
+            win.focusAfterLoad = ""
             var chat = Model.chatByJid(WhatsApp.chats, WhatsApp.selectedJid)
             win.unreadAck = Number((WhatsApp.acks && WhatsApp.acks[WhatsApp.selectedJid]) || 0)
             win.unreadCount = chat ? Number(chat.unreadCount || 0) : 0
@@ -779,6 +907,59 @@ ApplicationWindow {
                             }
                         }
                     }
+                    Rectangle {
+                        visible: win.searchOpen
+                        Layout.fillWidth: true
+                        implicitHeight: win.searchOpen ? 40 : 0
+                        color: Theme.railBg
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: 8
+                            anchors.rightMargin: 8
+                            anchors.topMargin: 4
+                            anchors.bottomMargin: 4
+                            spacing: 6
+                            Rectangle {
+                                Layout.fillWidth: true
+                                Layout.fillHeight: true
+                                radius: Theme.radiusSmall
+                                color: Theme.cardBg
+                                border.color: Theme.hairline
+                                border.width: 1
+                                TextInput {
+                                    id: findField
+                                    anchors.fill: parent
+                                    anchors.margins: 6
+                                    color: Theme.textPrimary
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: 13
+                                    clip: true
+                                    onTextChanged: win.runSearch()
+                                    onAccepted: win.stepResult(1)
+                                    Keys.onEscapePressed: win.closeSearch()
+                                }
+                                Text {
+                                    anchors.fill: parent
+                                    anchors.margins: 6
+                                    text: "Find in chat"
+                                    color: Theme.textDim
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: 13
+                                    visible: findField.text.length === 0
+                                }
+                            }
+                            Text {
+                                Layout.alignment: Qt.AlignVCenter
+                                text: win.findStatus
+                                textFormat: Text.PlainText
+                                color: Theme.textDim
+                                font.pixelSize: 12
+                            }
+                            AppButton { text: "\u2039"; iconOnly: true; onClicked: win.stepResult(-1) }
+                            AppButton { text: "\u203A"; iconOnly: true; onClicked: win.stepResult(1) }
+                            AppButton { text: "Close"; onClicked: win.closeSearch() }
+                        }
+                    }
                     Item {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
@@ -807,6 +988,10 @@ ApplicationWindow {
                                 message: modelData
                                 isGroup: !!(chat && chat.isGroup)
                                 onOpenMedia: function(msg) {
+                                    if (msg.kind === "document" && msg.localPath) {
+                                        WhatsApp.openFile(msg.localPath)
+                                        return
+                                    }
                                     win.viewer = msg
                                     if (msg.kind === "video" || msg.kind === "voice" || msg.kind === "audio"
                                         || (msg.kind === "gif" && Model.playsAsVideo(msg)))
@@ -876,6 +1061,7 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         Layout.margins: 10
                         voice: voice
+                        onPickEmoji: win.pickComposerEmoji()
                         onSent: function(msg) { win.queueSend(msg) }
                     }
                 }

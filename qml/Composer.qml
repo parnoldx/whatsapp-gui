@@ -49,6 +49,15 @@ Item {
     }
 
     signal sent(var message)
+    signal pickEmoji()
+
+    function insertEmoji(emoji) {
+        input.forceActiveFocus()
+        if (!emoji)
+            return
+        input.insert(input.cursorPosition, emoji)
+        persist()
+    }
 
     function quoteFrom(msg) {
         if (!msg || !msg.id) return { id: "", sender: "", text: "" }
@@ -262,6 +271,12 @@ Item {
         RowLayout {
             width: parent.width
             spacing: 6
+            AppButton {
+                iconOnly: true
+                Layout.alignment: Qt.AlignBottom
+                text: "\uF118"
+                onClicked: root.pickEmoji()
+            }
             AppButton {
                 text: "+"
                 iconOnly: true
