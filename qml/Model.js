@@ -56,13 +56,158 @@ function escapeHtml(value) {
     .replace(/"/g, "&quot;")
 }
 
-function linkify(text) {
-  var raw = String(text || "")
-  var escaped = escapeHtml(raw)
-  var html = escaped.replace(/(https?:\/\/[^\s&<]+)/gi, function (url) {
+// --- WhatsApp message markup (bold, italic, strike, mono, quotes, lists) ---
+
+// Qt's QML JS engine (V4) has no Unicode property escapes, so letter and
+// emoji tests use explicit ranges. Node accepts them; V4 silently fails.
+function isAlnum(ch) {
+  if (/[0-9A-Za-z]/.test(ch)) return true
+  if (ch.toLowerCase() !== ch.toUpperCase()) return true // cased letters: ä, я, …
+  return /[\u0590-\u05FF\u0600-\u06FF\u0900-\u097F\u0E00-\u0E7F\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]/.test(ch)
+}
+
+function isSpace(ch) {
+  return /\s/u.test(ch)
+}
+
+// Splits one line into styled runs. Mirrors WhatsApp's marker rules: an opener
+// is a lone marker after a boundary and before a non-space; a closer ends a run.
+function inlineSpans(line) {
+  var chars = Array.from(line)
+  var spans = []
+  var run = ""
+  var flags = [false, false, false] // bold, italic, strike
+  function flush() {
+    if (run) {
+      spans.push({ text: run, bold: flags[0], italic: flags[1], strike: flags[2], mono: false })
+      run = ""
+    }
+  }
+  function triple(at) {
+    return at + 2 < chars.length && chars[at] === "`" && chars[at + 1] === "`" && chars[at + 2] === "`"
+  }
+  function isOpener(i) {
+    var before = i === 0 || !isAlnum(chars[i - 1])
+    var after = i + 1 < chars.length && !isSpace(chars[i + 1]) && chars[i + 1] !== chars[i]
+    return before && after
+  }
+  function isCloser(i) {
+    var before = i > 0 && !isSpace(chars[i - 1]) && chars[i - 1] !== chars[i]
+    var after = i + 1 >= chars.length || !isAlnum(chars[i + 1])
+    return before && after
+  }
+  function hasCloser(from, marker) {
+    for (var j = from; j < chars.length; j++)
+      if (chars[j] === marker && isCloser(j)) return true
+    return false
+  }
+  var i = 0
+  while (i < chars.length) {
+    var c = chars[i]
+    if (triple(i)) {
+      var close = -1
+      for (var k = i + 3; k + 2 < chars.length; k++)
+        if (triple(k)) { close = k; break }
+      if (close > i + 3) {
+        flush()
+        spans.push({ text: chars.slice(i + 3, close).join(""), mono: true })
+        i = close + 3
+        continue
+      }
+    }
+    if (c === "`") {
+      var monoEnd = -1
+      for (var m = i + 1; m < chars.length; m++)
+        if (chars[m] === "`") { monoEnd = m; break }
+      if (monoEnd > i + 1) {
+        flush()
+        spans.push({ text: chars.slice(i + 1, monoEnd).join(""), mono: true })
+        i = monoEnd + 1
+        continue
+      }
+    }
+    var idx = c === "*" ? 0 : c === "_" ? 1 : c === "~" ? 2 : -1
+    if (idx >= 0) {
+      if (flags[idx]) {
+        if (isCloser(i)) { flush(); flags[idx] = false; i++; continue }
+      } else if (isOpener(i) && hasCloser(i + 1, c)) {
+        flush(); flags[idx] = true; i++; continue
+      }
+    }
+    run += c
+    i++
+  }
+  flush()
+  return spans
+}
+
+function spanHtml(span) {
+  var esc = escapeHtml(span.text)
+  if (span.mono)
+    return '<span style="background-color:rgba(128,128,128,46)">' + esc + "</span>"
+  var html = esc.replace(/(https?:\/\/[^\s&<]+)/gi, function (url) {
     return '<a href="' + url + '">' + url + "</a>"
   })
-  return { html: html.replace(/\n/g, "<br/>"), hasLinks: html.indexOf("<a href=") !== -1, plain: raw }
+  if (span.strike) html = "<s>" + html + "</s>"
+  if (span.italic) html = "<i>" + html + "</i>"
+  if (span.bold) html = "<b>" + html + "</b>"
+  return html
+}
+
+// True when the body is just a few emoji, which WhatsApp renders larger.
+function emojiOnly(text) {
+  var body = String(text || "").replace(/\s+/g, "")
+  if (!body) return false
+  var marks = body.match(/[\u{1F000}-\u{1FAFF}\u{2190}-\u{21FF}\u{2300}-\u{23FF}\u{2460}-\u{24FF}\u{25A0}-\u{27BF}\u{2900}-\u{297F}\u{2B00}-\u{2BFF}]/gu)
+  if (!marks || marks.length > 3) return false
+  return body.replace(/[\u{1F000}-\u{1FAFF}\u{2190}-\u{21FF}\u{2300}-\u{23FF}\u{2460}-\u{24FF}\u{25A0}-\u{27BF}\u{2900}-\u{297F}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}\u{20E3}]/gu, "").length === 0
+}
+
+// Renders WhatsApp markup to styled HTML plus the plain text for copying.
+function richText(text) {
+  var lines = String(text || "").split("\n")
+  var html = []
+  var plain = []
+  var inBlock = false
+  for (var li = 0; li < lines.length; li++) {
+    var line = lines[li]
+    if (li > 0) { html.push("<br/>"); plain.push("\n") }
+    if (line.replace(/\s+$/, "").trim() === "```") {
+      inBlock = !inBlock
+      continue
+    }
+    if (inBlock) {
+      html.push('<span style="background-color:rgba(128,128,128,46)">' + escapeHtml(line) + "</span>")
+      plain.push(line)
+      continue
+    }
+    var content = line
+    var quote = false
+    if (content.slice(0, 2) === "> ") { quote = true; content = content.slice(2) }
+    else if (content.charAt(0) === ">") { quote = true; content = content.slice(1) }
+    if (quote) { html.push("▎ "); plain.push("▎ ") }
+    var indent = content.length - content.replace(/^\s+/, "").length
+    var lead = content.slice(0, indent)
+    var body = content.slice(indent)
+    var bullet = /^[*\-•◦]\s/.exec(body)
+    if (bullet) {
+      lead += "•  "
+      body = body.slice(bullet[0].length)
+    }
+    if (lead) { html.push(escapeHtml(lead)); plain.push(lead) }
+    var spans = inlineSpans(body)
+    for (var s = 0; s < spans.length; s++) {
+      html.push(spanHtml(spans[s]))
+      plain.push(spans[s].text)
+    }
+  }
+  var out = html.join("")
+  return {
+    html: out,
+    plain: plain.join(""),
+    hasLinks: out.indexOf("<a href=") !== -1,
+    onlyEmoji: emojiOnly(plain.join(""))
+  }
 }
 
 function copyableText(m) {
@@ -623,7 +768,7 @@ if (typeof module !== "undefined" && module.exports) {
     formatTime: formatTime,
     formatDay: formatDay,
     escapeHtml: escapeHtml,
-    linkify: linkify,
+    richText: richText,
     copyableText: copyableText,
     filterChats: filterChats,
     visibleUnread: visibleUnread,

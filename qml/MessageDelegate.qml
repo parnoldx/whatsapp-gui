@@ -64,7 +64,7 @@ Item {
         var list = message && message.album ? message.album : []
         return (list && list.length > 1) ? list : []
     }
-    readonly property var linked: Model.linkify((message && (message.text || message.caption)) || "")
+    readonly property var rich: Model.richText((message && (message.text || message.caption)) || "")
     readonly property var preview: {
         var fromMsg = message && message.linkPreview
         var parsed = fromMsg && fromMsg.url ? fromMsg : Model.parseLink((message && (message.text || message.caption)) || "")
@@ -143,7 +143,7 @@ Item {
         anchors.left: fromMe ? undefined : parent.left
         anchors.right: fromMe ? parent.right : undefined
         spacing: 4
-        width: Math.min(root.width * 0.78, 420)
+        width: Math.min(root.width * 0.72, 520)
 
         Text {
             visible: root.isGroup && !root.fromMe && !!(message && message.senderName)
@@ -160,8 +160,9 @@ Item {
             width: col.width
             height: inner.implicitHeight + 16
             radius: Theme.radiusSmall
-            color: fromMe ? Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.18)
-                          : Qt.rgba(Theme.foreground.r, Theme.foreground.g, Theme.foreground.b, 0.08)
+            color: root.kind === "sticker" ? "transparent"
+                   : fromMe ? Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.18)
+                            : Qt.rgba(Theme.foreground.r, Theme.foreground.g, Theme.foreground.b, 0.08)
             border.width: root.highlighted ? 2 : 0
             border.color: Theme.accent
             Behavior on border.width { NumberAnimation { duration: 150 } }
@@ -185,12 +186,22 @@ Item {
                         cursorShape: Qt.PointingHandCursor
                         onClicked: if (message && message.quotedId) root.jumpTo(message.quotedId)
                     }
+                    Rectangle {
+                        anchors.left: parent.left
+                        anchors.top: parent.top
+                        anchors.bottom: parent.bottom
+                        anchors.margins: 5
+                        width: 3
+                        radius: 1.5
+                        color: Theme.accent
+                    }
                     Column {
                         id: quoteCol
                         anchors.left: parent.left
                         anchors.right: parent.right
                         anchors.verticalCenter: parent.verticalCenter
-                        anchors.margins: 6
+                        anchors.leftMargin: 10
+                        anchors.rightMargin: 6
                         Text {
                             visible: !!(message && message.quotedSender)
                             text: (message && message.quotedSender) || ""
@@ -425,24 +436,25 @@ Item {
 
                 Item {
                     id: bodyWrap
-                    visible: !!(linked.plain) && !urlOnly
+                    visible: !!(rich.plain) && !urlOnly
                     width: parent.width
-                    height: linked.hasLinks ? bodyLinks.implicitHeight : body.contentHeight
+                    height: rich.hasLinks ? bodyLinks.implicitHeight : body.contentHeight
 
                     // Real URLs stay on Text/StyledText. TextEdit.RichText keeps the
                     // last link char-format when ListView reuses the row, so a later
                     // plain message paints as a clickable TikTok (or whatever the
-                    // previous row linked).
+                    // previous row linked). Markup without links uses RichText so it
+                    // keeps selection.
                     Text {
                         id: bodyLinks
-                        visible: linked.hasLinks
+                        visible: rich.hasLinks
                         width: parent.width
                         wrapMode: Text.Wrap
                         textFormat: Text.StyledText
-                        text: linked.html
+                        text: rich.html
                         color: Theme.textPrimary
                         font.family: Theme.fontFamily
-                        font.pixelSize: 13
+                        font.pixelSize: rich.onlyEmoji ? 30 : 13
                         onLinkActivated: function(link) {
                             var parsed = Model.parseLink(link)
                             root.openLink(parsed && parsed.url ? parsed : { url: link }, false)
@@ -451,7 +463,7 @@ Item {
 
                     TextEdit {
                         id: body
-                        visible: !linked.hasLinks
+                        visible: !rich.hasLinks
                         width: parent.width
                         height: contentHeight
                         readOnly: true
@@ -461,13 +473,13 @@ Item {
                         cursorVisible: false
                         textMargin: 0
                         wrapMode: TextEdit.Wrap
-                        textFormat: TextEdit.PlainText
-                        text: linked.plain
+                        textFormat: TextEdit.RichText
+                        text: rich.html
                         color: Theme.textPrimary
                         selectionColor: Theme.selection
                         selectedTextColor: Theme.onAccent
                         font.family: Theme.fontFamily
-                        font.pixelSize: 13
+                        font.pixelSize: rich.onlyEmoji ? 30 : 13
                         Keys.onPressed: function(event) {
                             if (!event.matches(StandardKey.Copy))
                                 return
@@ -680,39 +692,6 @@ Item {
                     }
                 }
 
-                Row {
-                    visible: !!(message && message.reactions && message.reactions.length)
-                    spacing: 4
-                    Repeater {
-                        model: (message && message.reactions) || []
-                        Rectangle {
-                            required property var modelData
-                            height: 18
-                            width: chip.implicitWidth + 12
-                            radius: 9
-                            color: modelData.mine
-                                ? Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.30)
-                                : Qt.rgba(Theme.foreground.r, Theme.foreground.g, Theme.foreground.b, 0.12)
-                            Text {
-                                id: chip
-                                anchors.centerIn: parent
-                                text: modelData.emoji + (modelData.count > 1 ? " " + modelData.count : "")
-                                textFormat: Text.PlainText
-                                color: Theme.textPrimary
-                                font.pixelSize: 11
-                            }
-                            MouseArea {
-                                anchors.fill: parent
-                                hoverEnabled: true
-                                onClicked: root.react(root.message, modelData.mine ? "" : modelData.emoji)
-                                ToolTip.visible: containsMouse && !!tipText
-                                ToolTip.text: tipText
-                                readonly property string tipText:
-                                    (modelData.who && modelData.who.length ? modelData.who.join(", ") : "")
-                            }
-                        }
-                    }
-                }
             }
 
             MouseArea {
@@ -736,6 +715,51 @@ Item {
                     text: "Remove reaction"
                     enabled: !!(root.message && root.message.myReaction)
                     onTriggered: root.react(root.message, "")
+                }
+            }
+        }
+
+        Item {
+            id: reactionSlot
+            visible: !!(message && message.reactions && message.reactions.length)
+            width: col.width
+            height: visible ? reactionRow.height - 6 : 0
+            Row {
+                id: reactionRow
+                x: root.fromMe ? parent.width - width : 0
+                anchors.top: parent.top
+                anchors.topMargin: -6
+                spacing: 4
+                Repeater {
+                    model: (message && message.reactions) || []
+                    Rectangle {
+                        required property var modelData
+                        height: 18
+                        width: chip.implicitWidth + 12
+                        radius: 9
+                        color: modelData.mine
+                            ? Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.30)
+                            : Qt.rgba(Theme.foreground.r, Theme.foreground.g, Theme.foreground.b, 0.12)
+                        border.width: modelData.mine ? 1 : 0
+                        border.color: Theme.accent
+                        Text {
+                            id: chip
+                            anchors.centerIn: parent
+                            text: modelData.emoji + (modelData.count > 1 ? " " + modelData.count : "")
+                            textFormat: Text.PlainText
+                            color: Theme.textPrimary
+                            font.pixelSize: 11
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            onClicked: root.react(root.message, modelData.mine ? "" : modelData.emoji)
+                            ToolTip.visible: containsMouse && !!tipText
+                            ToolTip.text: tipText
+                            readonly property string tipText:
+                                (modelData.who && modelData.who.length ? modelData.who.join(", ") : "")
+                        }
+                    }
                 }
             }
         }

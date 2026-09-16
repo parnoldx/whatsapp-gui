@@ -11,12 +11,53 @@ test("initials and avatar index stay stable", () => {
   assert.ok(a >= 0 && a < 8)
 })
 
-test("linkify escapes html and wraps urls", () => {
-  const linked = Model.linkify('see <script> https://example.com/a?x=1')
+test("richText escapes html and wraps urls", () => {
+  const linked = Model.richText('see <script> https://example.com/a?x=1')
   assert.equal(linked.hasLinks, true)
   assert.match(linked.html, /<a href="https:\/\/example.com\/a\?x=1">/)
   assert.equal(linked.html.indexOf("<script>"), -1)
   assert.match(linked.html, /&lt;script&gt;/)
+})
+
+test("richText applies whatsapp markers", () => {
+  assert.match(Model.richText("a *bold* b").html, /<b>bold<\/b>/)
+  assert.match(Model.richText("a _italic_ b").html, /<i>italic<\/i>/)
+  assert.match(Model.richText("a ~struck~ b").html, /<s>struck<\/s>/)
+  assert.match(Model.richText("a `code` b").html, /background-color:rgba\(128,128,128,46\)">code<\/span>/)
+  assert.match(Model.richText("```py```").html, />py<\/span>/)
+  assert.equal(Model.richText("2 * 3 = 6").html, "2 * 3 = 6")
+  assert.equal(Model.richText("*unclosed").plain, "*unclosed")
+})
+
+test("richText renders quotes, lists and fenced blocks", () => {
+  assert.equal(Model.richText("> quoted").plain, "▎ quoted")
+  assert.equal(Model.richText("* item").plain, "•  item")
+  assert.equal(Model.richText("- item").plain, "•  item")
+  const block = Model.richText("```\ncode line\n```")
+  assert.equal(block.plain, "\ncode line\n")
+  assert.match(block.html, /code line/)
+})
+
+test("richText flags emoji-only bodies", () => {
+  assert.equal(Model.richText("😀").onlyEmoji, true)
+  assert.equal(Model.richText("😀😂🔥").onlyEmoji, true)
+  assert.equal(Model.richText("🚦").onlyEmoji, true)
+  assert.equal(Model.richText("🇩🇪").onlyEmoji, true)
+  assert.equal(Model.richText("hi 😀").onlyEmoji, false)
+  assert.equal(Model.richText("🎉🎉🎉🎉").onlyEmoji, false)
+})
+
+test("markup boundaries treat non-ascii letters as word characters", () => {
+  assert.equal(Model.richText("wörter*kein bold*").html.indexOf("<b>"), -1)
+  assert.match(Model.richText("ä *bold* ö").html, /<b>bold<\/b>/)
+})
+
+// Qt's QML JS engine has no \p{...} property escapes and silently returns
+// false instead of failing, so a Node-passing test proves nothing there.
+test("Model.js avoids regex property escapes", () => {
+  const source = require("node:fs").readFileSync(
+    require("node:path").join(__dirname, "..", "qml", "Model.js"), "utf8")
+  assert.equal(/\\p\{/.test(source), false)
 })
 
 test("copyableText prefers body text then caption then location", () => {
